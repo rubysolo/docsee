@@ -17,7 +17,12 @@ pipeline can be embedded in any host application:
 
 - **Images** (jpg, png, tiff, bmp — by extension or content sniff) are normalized
   (EXIF orientation applied, alpha flattened, converted to RGB) and OCR'd directly.
-- **PDFs** get native text extraction first. If that yields fewer than 50 characters
+- **Auto-Rotation**: Optional content-based orientation detection. When enabled,
+  it tries rotating the image (0, 90, 180, 270 degrees) and picks the one with
+  the highest Tesseract confidence. This catches upside-down scans that lack
+  EXIF metadata.
+- **PDFs** get native text extraction first.
+ If that yields fewer than 50 characters
   per page (configurable), the pages are rendered at 200 DPI (configurable) and OCR'd.
 - If native extraction fails outright, OCR is tried as a recovery path.
 
@@ -52,6 +57,7 @@ docsee document.pdf                   # extracted text to stdout
 docsee document.pdf --json            # full extraction record as JSON
 docsee scan.pdf --ocr --dpi 300       # force OCR at 300 DPI
 docsee brief.pdf --lang deu           # German tessdata
+docsee scan.jpg --auto-rotate         # detect and fix orientation
 docsee photo.jpg                      # images are OCR'd directly
 ```
 
@@ -80,6 +86,7 @@ let mut engine = Engine::builder()
     .ocr_language("eng")      // tesseract language (default "eng")
     .ocr_dpi(200.0)           // render DPI for OCR (default 200)
     .min_chars_per_page(50)   // OCR-fallback threshold (default 50)
+    .auto_rotate(true)        // detect and fix orientation (default false)
     .build()?;
 
 let result = engine.extract(std::path::Path::new("document.pdf"));
@@ -108,6 +115,7 @@ lets callers that know the file type (e.g. from a MIME type) skip detection.
 | `.ocr_language(...)` | builder / `--lang` | Tesseract language code |
 | `.ocr_dpi(...)` | builder / `--dpi` | PDF render DPI for OCR |
 | `.min_chars_per_page(...)` | builder / `--min-chars-per-page` | OCR-fallback threshold |
+| `.auto_rotate(...)` | builder / `--auto-rotate` | Enable auto-orientation |
 
 `libpdfium` search order: the builder override, `$PDFIUM_LIB_DIR`, `./lib` next to
 the executable, `./lib` under the cwd, then system library paths.

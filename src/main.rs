@@ -30,6 +30,10 @@ struct Args {
     /// Chars-per-page threshold below which native extraction falls back to OCR
     #[arg(long, default_value_t = MIN_CHARS_PER_PAGE)]
     min_chars_per_page: usize,
+
+    /// Automatically detect and correct image orientation before OCR
+    #[arg(long)]
+    auto_rotate: bool,
 }
 
 fn main() -> Result<()> {
@@ -39,6 +43,7 @@ fn main() -> Result<()> {
         .ocr_language(&args.lang)
         .ocr_dpi(args.dpi)
         .min_chars_per_page(args.min_chars_per_page)
+        .auto_rotate(args.auto_rotate)
         .build()?;
 
     let result = if args.ocr && !has_image_extension(&args.file) {

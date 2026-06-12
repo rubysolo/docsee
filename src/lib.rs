@@ -72,6 +72,7 @@ pub struct EngineBuilder {
     ocr_dpi: Option<f32>,
     min_chars_per_page: Option<usize>,
     pdfium_lib_dir: Option<String>,
+    auto_rotate: bool,
 }
 
 impl EngineBuilder {
@@ -100,6 +101,14 @@ impl EngineBuilder {
     /// binary, not this crate.
     pub fn pdfium_lib_dir(mut self, dir: impl Into<String>) -> Self {
         self.pdfium_lib_dir = Some(dir.into());
+        self
+    }
+
+    /// Enable automatic orientation detection (OSD-like) via multi-angle
+    /// confidence check. This will try rotating the image 0, 90, 180, and 270
+    /// degrees and pick the one with highest Tesseract confidence.
+    pub fn auto_rotate(mut self, enable: bool) -> Self {
+        self.auto_rotate = enable;
         self
     }
 
@@ -158,6 +167,7 @@ impl EngineBuilder {
             ocr,
             ocr_dpi: self.ocr_dpi.unwrap_or(OCR_DPI),
             min_chars_per_page: self.min_chars_per_page.unwrap_or(MIN_CHARS_PER_PAGE),
+            auto_rotate: self.auto_rotate,
         })
     }
 }
@@ -167,6 +177,7 @@ pub struct Engine {
     ocr: LepTess,
     ocr_dpi: f32,
     min_chars_per_page: usize,
+    auto_rotate: bool,
 }
 
 impl Engine {
@@ -218,7 +229,19 @@ impl Engine {
             let bitmap = page
                 .render_with_config(&config)
                 .with_context(|| format!("pdfium render failed on page {}", i + 1))?;
-            let image = bitmap.as_image();
+            let mut image = bitmap.as_image();
+
+            if self.auto_rotate {
+                let angle = detect_orientation(&mut self.ocr, &image)?;
+                if angle != 0 {
+                    image = match angle {
+                        90 => image.rotate90(),
+                        180 => image.rotate180(),
+                        270 => image.rotate270(),
+                        _ => image,
+                    };
+                }
+            }
 
             let mut png = Vec::new();
             image
@@ -238,16 +261,39 @@ impl Engine {
     /// OCR an image file after normalizing it (EXIF orientation applied,
     /// converted to RGB).
     pub fn extract_image_ocr(&mut self, path: &Path) -> Result<(Vec<PageText>, usize)> {
-        let text = match normalize_image_for_ocr_png(path) {
-            Ok(png) => ocr_bytes(&mut self.ocr, &png)?,
-            Err(normalize_err) => {
+        let (text, chars) = if self.auto_rotate {
+            let image = normalize_image_for_ocr(path).or_else(|_| {
                 let bytes = std::fs::read(path).context("read image file")?;
-                ocr_bytes(&mut self.ocr, &bytes).with_context(|| {
-                    format!("image normalization failed first: {normalize_err:?}")
-                })?
-            }
+                image::load_from_memory(&bytes).context("load image from memory")
+            })?;
+            let angle = detect_orientation(&mut self.ocr, &image)?;
+            let rotated = match angle {
+                0 => image,
+                90 => image.rotate90(),
+                180 => image.rotate180(),
+                270 => image.rotate270(),
+                _ => image,
+            };
+            let mut png = Vec::new();
+            rotated
+                .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+                .context("PNG encode failed")?;
+            let text = ocr_bytes(&mut self.ocr, &png)?;
+            let chars = text.chars().count();
+            (text, chars)
+        } else {
+            let text = match normalize_image_for_ocr_png(path) {
+                Ok(png) => ocr_bytes(&mut self.ocr, &png)?,
+                Err(normalize_err) => {
+                    let bytes = std::fs::read(path).context("read image file")?;
+                    ocr_bytes(&mut self.ocr, &bytes).with_context(|| {
+                        format!("image normalization failed first: {normalize_err:?}")
+                    })?
+                }
+            };
+            let chars = text.chars().count();
+            (text, chars)
         };
-        let chars = text.chars().count();
         Ok((vec![PageText { page: 1, text }], chars))
     }
 
@@ -315,6 +361,43 @@ impl Engine {
     }
 }
 
+fn detect_orientation(ocr: &mut LepTess, image: &DynamicImage) -> Result<u32> {
+    let angles = [0, 90, 180, 270];
+    let mut best_angle = 0;
+    let mut best_conf = -1;
+
+    for &angle in &angles {
+        let rotated = match angle {
+            0 => image.clone(),
+            90 => image.rotate90(),
+            180 => image.rotate180(),
+            270 => image.rotate270(),
+            _ => unreachable!(),
+        };
+
+        let mut png = Vec::new();
+        rotated
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .context("PNG encode for OSD check failed")?;
+
+        ocr.set_image_from_mem(&png)
+            .context("tesseract set_image for OSD check failed")?;
+        let _ = ocr.get_utf8_text().context("OSD check OCR failed")?;
+        let conf = ocr.mean_text_conf();
+
+        if conf > best_conf {
+            best_conf = conf;
+            best_angle = angle;
+        }
+
+        // Optimization: if confidence is high enough, we can stop early
+        if best_conf > 90 {
+            break;
+        }
+    }
+    Ok(best_angle)
+}
+
 fn ocr_png_bytes(ocr: &mut LepTess, png: &[u8], dpi: i32) -> Result<String> {
     ocr.set_image_from_mem(png)
         .context("tesseract set_image failed")?;
@@ -329,6 +412,15 @@ fn ocr_bytes(ocr: &mut LepTess, bytes: &[u8]) -> Result<String> {
 }
 
 fn normalize_image_for_ocr_png(path: &Path) -> Result<Vec<u8>> {
+    let image = normalize_image_for_ocr(path)?;
+    let mut png = Vec::new();
+    image
+        .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .context("PNG re-encode failed")?;
+    Ok(png)
+}
+
+fn normalize_image_for_ocr(path: &Path) -> Result<DynamicImage> {
     let reader = ImageReader::open(path)
         .context("open image file")?
         .with_guessed_format()
@@ -352,12 +444,7 @@ fn normalize_image_for_ocr_png(path: &Path) -> Result<Vec<u8>> {
     } else {
         image.to_rgb8()
     };
-
-    let mut png = Vec::new();
-    DynamicImage::ImageRgb8(rgb)
-        .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
-        .context("PNG re-encode failed")?;
-    Ok(png)
+    Ok(DynamicImage::ImageRgb8(rgb))
 }
 
 fn has_image_extension(path: &Path) -> bool {

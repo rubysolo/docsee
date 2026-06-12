@@ -18,7 +18,33 @@ fn main() {
     gen_transparent_png(&dir.join("transparent.png"));
     gen_multipage_pdf(&dir.join("multipage.pdf"));
     gen_image_dat(&dir.join("image.dat"));
+    gen_rotated_fixtures(&dir);
     println!("fixtures written to {}", dir.display());
+}
+
+fn gen_rotated_fixtures(dir: &Path) {
+    let src = image::open(dir.join("sample.png")).expect("sample.png");
+
+    // Convert to RGBA and composite over white to ensure clean rotation
+    let mut canvas =
+        image::RgbaImage::from_pixel(src.width(), src.height(), image::Rgba([255, 255, 255, 255]));
+    image::imageops::overlay(&mut canvas, &src.to_rgba8(), 0, 0);
+    let white_src = image::DynamicImage::ImageRgba8(canvas);
+
+    white_src
+        .rotate90()
+        .save(dir.join("rotated_90.png"))
+        .expect("save rotated_90.png");
+    white_src
+        .rotate180()
+        .save(dir.join("rotated_180.png"))
+        .expect("save rotated_180.png");
+    white_src
+        .rotate270()
+        .save(dir.join("rotated_270.png"))
+        .expect("save rotated_270.png");
+
+    eprintln!("  {}/rotated_*.png", dir.display());
 }
 
 /// JPEG whose pixels are physically rotated 90° CCW but carry EXIF orientation = 6
