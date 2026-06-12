@@ -70,6 +70,66 @@ fn builder_options_apply() {
 }
 
 #[test]
+fn exif_rotated_jpeg_corrected_before_ocr() {
+    // Pixels are physically 90° CCW; EXIF orientation=6 tells the decoder to
+    // rotate 90° CW.  normalize_image_for_ocr_png applies that correction so
+    // the text is upright when Tesseract sees it.
+    let mut engine = Engine::new().unwrap();
+    let result = engine.extract(&fixture("exif_rotated.jpg"));
+
+    assert_eq!(result.error, None);
+    assert_eq!(result.extractor, Some(Extractor::OcrImage));
+    assert!(full_text(&result).contains(EXPECTED));
+}
+
+#[test]
+fn transparent_png_composites_over_white() {
+    // Background pixels have alpha=0; normalize_image_for_ocr_png blends over
+    // a white canvas so black text stays visible for OCR.
+    let mut engine = Engine::new().unwrap();
+    let result = engine.extract(&fixture("transparent.png"));
+
+    assert_eq!(result.error, None);
+    assert_eq!(result.extractor, Some(Extractor::OcrImage));
+    assert!(full_text(&result).contains(EXPECTED));
+}
+
+#[test]
+fn multipage_pdf_reports_correct_page_count() {
+    let mut engine = Engine::new().unwrap();
+    let result = engine.extract(&fixture("multipage.pdf"));
+
+    assert_eq!(result.error, None);
+    assert_eq!(result.n_pages, 2);
+    assert_eq!(result.pages.len(), 2);
+    assert!(full_text(&result).contains(EXPECTED));
+}
+
+#[test]
+fn content_sniff_routes_extensionless_image_to_ocr() {
+    // image.dat is a PNG renamed to a non-image extension.  sniffs_as_image
+    // reads the magic bytes and still routes to OcrImage.
+    let mut engine = Engine::new().unwrap();
+    let result = engine.extract(&fixture("image.dat"));
+
+    assert_eq!(result.error, None);
+    assert_eq!(result.extractor, Some(Extractor::OcrImage));
+    assert!(full_text(&result).contains(EXPECTED));
+}
+
+#[test]
+fn extract_with_hint_true_forces_image_path() {
+    // Passing treat_as_image=true short-circuits the sniff and extension check,
+    // routing directly to extract_image_ocr.
+    let mut engine = Engine::new().unwrap();
+    let result = engine.extract_with_hint(&fixture("image.dat"), true);
+
+    assert_eq!(result.error, None);
+    assert_eq!(result.extractor, Some(Extractor::OcrImage));
+    assert!(full_text(&result).contains(EXPECTED));
+}
+
+#[test]
 fn extraction_serializes_with_snake_case_labels() {
     let mut engine = Engine::new().unwrap();
     let result = engine.extract(&fixture("digital.pdf"));
