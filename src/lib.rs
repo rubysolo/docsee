@@ -226,28 +226,8 @@ impl Engine {
         let mut pages = Vec::new();
         let mut total = 0;
         for (i, page) in doc.pages().iter().enumerate() {
-            let bitmap = page
-                .render_with_config(&config)
-                .with_context(|| format!("pdfium render failed on page {}", i + 1))?;
-            let mut image = bitmap.as_image();
-
-            if self.auto_rotate {
-                let angle = detect_orientation(&mut self.ocr, &image)?;
-                if angle != 0 {
-                    image = match angle {
-                        90 => image.rotate90(),
-                        180 => image.rotate180(),
-                        270 => image.rotate270(),
-                        _ => image,
-                    };
-                }
-            }
-
-            let mut png = Vec::new();
-            image
-                .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
-                .context("PNG encode failed")?;
-
+            let png = render_page_to_png(&mut self.ocr, self.auto_rotate, &page, &config)
+                .with_context(|| format!("render failed on page {}", i + 1))?;
             let text = ocr_png_bytes(&mut self.ocr, &png, dpi as i32)?;
             total += text.chars().count();
             pages.push(PageText {
@@ -256,6 +236,65 @@ impl Engine {
             });
         }
         Ok((pages, total))
+    }
+
+    /// Render every PDF page to PNG bytes at `dpi`, honoring the engine's
+    /// auto-rotate setting. Returned in page order (index 0 = page 1).
+    ///
+    /// This is the rasterization the OCR path performs internally, surfaced
+    /// for callers that need the page image itself (e.g. thumbnails) rather
+    /// than its OCR text. `dpi` trades size for sharpness independently of the
+    /// OCR DPI; thumbnails typically want less than [`OCR_DPI`].
+    pub fn render_pdf_pages_png(&mut self, path: &Path, dpi: f32) -> Result<Vec<Vec<u8>>> {
+        let doc = self
+            .pdfium
+            .load_pdf_from_file(path, None)
+            .context("pdfium failed to open document for render")?;
+        let config = PdfRenderConfig::new().scale_page_by_factor(dpi / 72.0);
+
+        let mut out = Vec::with_capacity(doc.pages().len() as usize);
+        for (i, page) in doc.pages().iter().enumerate() {
+            out.push(
+                render_page_to_png(&mut self.ocr, self.auto_rotate, &page, &config)
+                    .with_context(|| format!("render failed on page {}", i + 1))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Render a file to PNG page images, detecting its type the same way
+    /// [`extract`](Self::extract) does: an image file yields a single
+    /// normalized PNG (EXIF orientation applied, alpha composited over white);
+    /// a PDF yields one PNG per page at `dpi`, auto-rotate honored. Page order;
+    /// index 0 = page 1. This is the high-level entry thumbnail callers want —
+    /// one call regardless of whether the upload was a scan or a photo.
+    pub fn render_pages_png(&mut self, path: &Path, dpi: f32) -> Result<Vec<Vec<u8>>> {
+        if has_image_extension(path) || sniffs_as_image(path) {
+            Ok(vec![normalize_image_for_ocr_png(path)?])
+        } else {
+            self.render_pdf_pages_png(path, dpi)
+        }
+    }
+
+    /// Render a single 1-based PDF page to PNG bytes at `dpi` (auto-rotate
+    /// honored). Useful as a render-on-demand path when only one page is
+    /// needed.
+    pub fn render_pdf_page_png(
+        &mut self,
+        path: &Path,
+        page_number: u16,
+        dpi: f32,
+    ) -> Result<Vec<u8>> {
+        let doc = self
+            .pdfium
+            .load_pdf_from_file(path, None)
+            .context("pdfium failed to open document for render")?;
+        let config = PdfRenderConfig::new().scale_page_by_factor(dpi / 72.0);
+        let page = doc
+            .pages()
+            .get(page_number.saturating_sub(1))
+            .with_context(|| format!("no page {page_number} in document"))?;
+        render_page_to_png(&mut self.ocr, self.auto_rotate, &page, &config)
     }
 
     /// OCR an image file after normalizing it (EXIF orientation applied,
@@ -267,13 +306,7 @@ impl Engine {
                 image::load_from_memory(&bytes).context("load image from memory")
             })?;
             let angle = detect_orientation(&mut self.ocr, &image)?;
-            let rotated = match angle {
-                0 => image,
-                90 => image.rotate90(),
-                180 => image.rotate180(),
-                270 => image.rotate270(),
-                _ => image,
-            };
+            let rotated = rotate_image(image, angle);
             let mut png = Vec::new();
             rotated
                 .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
@@ -358,6 +391,45 @@ impl Engine {
         }
 
         out
+    }
+}
+
+/// Render one pdfium page to PNG bytes, applying auto-rotation when enabled.
+///
+/// A free function (rather than a method) on purpose: it borrows `ocr` while
+/// the caller still holds the `PdfDocument` borrowed from `self.pdfium`, the
+/// same disjoint-field-borrow the OCR paths rely on. `self.method()` would
+/// borrow all of `self` and conflict.
+fn render_page_to_png(
+    ocr: &mut LepTess,
+    auto_rotate: bool,
+    page: &PdfPage,
+    config: &PdfRenderConfig,
+) -> Result<Vec<u8>> {
+    let bitmap = page
+        .render_with_config(config)
+        .context("pdfium render failed")?;
+    let mut image = bitmap.as_image();
+
+    if auto_rotate {
+        let angle = detect_orientation(ocr, &image)?;
+        image = rotate_image(image, angle);
+    }
+
+    let mut png = Vec::new();
+    image
+        .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .context("PNG encode failed")?;
+    Ok(png)
+}
+
+/// Rotate by a detected angle (90/180/270); any other value is a no-op.
+fn rotate_image(image: DynamicImage, angle: u32) -> DynamicImage {
+    match angle {
+        90 => image.rotate90(),
+        180 => image.rotate180(),
+        270 => image.rotate270(),
+        _ => image,
     }
 }
 
