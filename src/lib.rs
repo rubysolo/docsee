@@ -65,6 +65,16 @@ pub struct Extraction {
     pub error: Option<String>,
 }
 
+/// One page selected from a source PDF for re-packaging via
+/// [`Engine::assemble_pdf`].
+#[derive(Debug, Clone, Copy)]
+pub struct PageRef<'a> {
+    /// Path to the source PDF.
+    pub path: &'a Path,
+    /// 1-based page number within that PDF.
+    pub page_number: u16,
+}
+
 /// Configures and builds an [`Engine`]. Created via [`Engine::builder`].
 #[derive(Debug, Clone, Default)]
 pub struct EngineBuilder {
@@ -295,6 +305,35 @@ impl Engine {
             .get(page_number.saturating_sub(1))
             .with_context(|| format!("no page {page_number} in document"))?;
         render_page_to_png(&mut self.ocr, self.auto_rotate, &page, &config)
+    }
+
+    /// Re-package selected pages from one or more source PDFs into a single new
+    /// PDF, copying page content natively (no rasterization, so text and vectors
+    /// survive). Pages appear in the order given and sources may interleave;
+    /// returns the new PDF's bytes.
+    ///
+    /// Each source is reopened per page it contributes — fine for the occasional
+    /// assembly this is built for (e.g. a reviewed document spanning uploads);
+    /// cache by path if it ever runs hot.
+    pub fn assemble_pdf(&mut self, pages: &[PageRef]) -> Result<Vec<u8>> {
+        let mut dest = self
+            .pdfium
+            .create_new_pdf()
+            .context("pdfium failed to create the output document")?;
+
+        for page in pages {
+            let src = self
+                .pdfium
+                .load_pdf_from_file(page.path, None)
+                .with_context(|| format!("open source pdf {:?}", page.path))?;
+
+            let at = dest.pages().len();
+            dest.pages_mut()
+                .copy_page_from_document(&src, page.page_number.saturating_sub(1), at)
+                .with_context(|| format!("copy page {} of {:?}", page.page_number, page.path))?;
+        }
+
+        dest.save_to_bytes().context("save the assembled pdf")
     }
 
     /// OCR an image file after normalizing it (EXIF orientation applied,
