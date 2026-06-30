@@ -27,6 +27,10 @@ use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::path::Path;
 
+// Re-exported so callers can name the type accepted by
+// [`EngineBuilder::assembly_page_size`] without depending on `pdfium-render`.
+pub use pdfium_render::prelude::{PdfPagePaperSize, PdfPagePaperStandardSize, PdfPoints};
+
 /// Default DPI at which PDF pages are rendered before OCR.
 pub const OCR_DPI: f32 = 200.0;
 /// Default OCR-fallback threshold: native extraction yielding fewer
@@ -83,6 +87,7 @@ pub struct EngineBuilder {
     min_chars_per_page: Option<usize>,
     pdfium_lib_dir: Option<String>,
     auto_rotate: bool,
+    assembly_page_size: Option<PdfPagePaperSize>,
 }
 
 impl EngineBuilder {
@@ -119,6 +124,16 @@ impl EngineBuilder {
     /// degrees and pick the one with highest Tesseract confidence.
     pub fn auto_rotate(mut self, enable: bool) -> Self {
         self.auto_rotate = enable;
+        self
+    }
+
+    /// Page size used when [`assemble_pdf`](Engine::assemble_pdf) embeds an
+    /// image source as a full page (default: US-Letter portrait). Each image is
+    /// contain-fit and centered on a page of this size, so it has no effect on
+    /// PDF sources, which are copied at their native page size. Use
+    /// [`PdfPagePaperSize::Custom`] for an arbitrary size in points.
+    pub fn assembly_page_size(mut self, size: PdfPagePaperSize) -> Self {
+        self.assembly_page_size = Some(size);
         self
     }
 
@@ -178,6 +193,9 @@ impl EngineBuilder {
             ocr_dpi: self.ocr_dpi.unwrap_or(OCR_DPI),
             min_chars_per_page: self.min_chars_per_page.unwrap_or(MIN_CHARS_PER_PAGE),
             auto_rotate: self.auto_rotate,
+            assembly_page_size: self
+                .assembly_page_size
+                .unwrap_or_else(default_assembly_page_size),
         })
     }
 }
@@ -188,6 +206,7 @@ pub struct Engine {
     ocr_dpi: f32,
     min_chars_per_page: usize,
     auto_rotate: bool,
+    assembly_page_size: PdfPagePaperSize,
 }
 
 impl Engine {
@@ -307,10 +326,23 @@ impl Engine {
         render_page_to_png(&mut self.ocr, self.auto_rotate, &page, &config)
     }
 
-    /// Re-package selected pages from one or more source PDFs into a single new
-    /// PDF, copying page content natively (no rasterization, so text and vectors
-    /// survive). Pages appear in the order given and sources may interleave;
-    /// returns the new PDF's bytes.
+    /// Re-package selected pages from one or more sources into a single new PDF.
+    /// Pages appear in the order given and sources may interleave; returns the
+    /// new PDF's bytes.
+    ///
+    /// Sources are detected per [`PageRef`] (by extension or content sniff, the
+    /// same way [`extract`](Self::extract) detects them):
+    ///
+    /// - **PDF source** — the page is copied natively (no rasterization, so text
+    ///   and vectors survive) at its original page size.
+    /// - **Image source** (PNG/JPG/TIFF/BMP, including image bytes saved under a
+    ///   `.pdf` name) — embedded as a full-page image: EXIF orientation applied
+    ///   and any alpha composited over white (deterministic; `auto_rotate` is
+    ///   *not* applied, since assembly produces a canonical artifact rather than
+    ///   maximizing OCR confidence), then contain-fit and centered on a page of
+    ///   the configured [`assembly_page_size`](EngineBuilder::assembly_page_size)
+    ///   (default US-Letter). `page_number` is ignored for image sources — an
+    ///   image is single-page, so the one image is always emitted.
     ///
     /// Each source is reopened per page it contributes — fine for the occasional
     /// assembly this is built for (e.g. a reviewed document spanning uploads);
@@ -322,15 +354,22 @@ impl Engine {
             .context("pdfium failed to create the output document")?;
 
         for page in pages {
-            let src = self
-                .pdfium
-                .load_pdf_from_file(page.path, None)
-                .with_context(|| format!("open source pdf {:?}", page.path))?;
+            if has_image_extension(page.path) || sniffs_as_image(page.path) {
+                append_image_page(&mut dest, page.path, self.assembly_page_size)
+                    .with_context(|| format!("embed image source {:?}", page.path))?;
+            } else {
+                let src = self
+                    .pdfium
+                    .load_pdf_from_file(page.path, None)
+                    .with_context(|| format!("open source pdf {:?}", page.path))?;
 
-            let at = dest.pages().len();
-            dest.pages_mut()
-                .copy_page_from_document(&src, page.page_number.saturating_sub(1), at)
-                .with_context(|| format!("copy page {} of {:?}", page.page_number, page.path))?;
+                let at = dest.pages().len();
+                dest.pages_mut()
+                    .copy_page_from_document(&src, page.page_number.saturating_sub(1), at)
+                    .with_context(|| {
+                        format!("copy page {} of {:?}", page.page_number, page.path)
+                    })?;
+            }
         }
 
         dest.save_to_bytes().context("save the assembled pdf")
@@ -460,6 +499,53 @@ fn render_page_to_png(
         .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
         .context("PNG encode failed")?;
     Ok(png)
+}
+
+/// Default page size for image sources embedded by [`Engine::assemble_pdf`]:
+/// US-Letter portrait (612 x 792 pt).
+fn default_assembly_page_size() -> PdfPagePaperSize {
+    PdfPagePaperSize::new_portrait(PdfPagePaperStandardSize::USLetterAnsiA)
+}
+
+/// Append a single image file to `dest` as a full page: normalize (EXIF +
+/// alpha-over-white), contain-fit to `page_size`, centered.
+///
+/// A free function (not a method) so it can borrow `dest` mutably while the
+/// caller still holds `self.pdfium` borrowed (`dest` is created from it) — the
+/// same disjoint-borrow shape [`render_page_to_png`] relies on.
+fn append_image_page(
+    dest: &mut PdfDocument,
+    path: &Path,
+    page_size: PdfPagePaperSize,
+) -> Result<()> {
+    let img = normalize_image_for_ocr(path)?;
+
+    let page_w = page_size.width().value;
+    let page_h = page_size.height().value;
+
+    let (iw, ih) = (img.width() as f32, img.height() as f32);
+    // contain: scale to fit inside the page, preserving aspect ratio
+    let scale = (page_w / iw).min(page_h / ih);
+    let draw_w = iw * scale;
+    let draw_h = ih * scale;
+    let offset_x = (page_w - draw_w) / 2.0;
+    let offset_y = (page_h - draw_h) / 2.0;
+
+    let mut pdf_page = dest
+        .pages_mut()
+        .create_page_at_end(page_size)
+        .context("create image page")?;
+    pdf_page
+        .objects_mut()
+        .create_image_object(
+            PdfPoints::new(offset_x),
+            PdfPoints::new(offset_y),
+            &img,
+            Some(PdfPoints::new(draw_w)),
+            Some(PdfPoints::new(draw_h)),
+        )
+        .context("place image on page")?;
+    Ok(())
 }
 
 /// Rotate by a detected angle (90/180/270); any other value is a no-op.
