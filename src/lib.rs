@@ -558,17 +558,35 @@ fn rotate_image(image: DynamicImage, angle: u32) -> DynamicImage {
     }
 }
 
+/// Largest dimension of the image used for the orientation vote
+/// (~100 DPI on a US-Letter page).
+const DETECT_MAX_DIM: u32 = 1000;
+
 fn detect_orientation(ocr: &mut LepTess, image: &DynamicImage) -> Result<u32> {
+    // Orientation is a coarse best-of-four vote; it doesn't need full OCR
+    // resolution. Detection is the dominant OCR cost (up to 4 passes per page
+    // at OCR DPI), so vote on a downscaled copy — the extraction pass that
+    // follows still runs on the full-resolution image.
+    let probe = if image.width().max(image.height()) > DETECT_MAX_DIM {
+        image.resize(
+            DETECT_MAX_DIM,
+            DETECT_MAX_DIM,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        image.clone()
+    };
+
     let angles = [0, 90, 180, 270];
     let mut best_angle = 0;
     let mut best_conf = -1;
 
     for &angle in &angles {
         let rotated = match angle {
-            0 => image.clone(),
-            90 => image.rotate90(),
-            180 => image.rotate180(),
-            270 => image.rotate270(),
+            0 => probe.clone(),
+            90 => probe.rotate90(),
+            180 => probe.rotate180(),
+            270 => probe.rotate270(),
             _ => unreachable!(),
         };
 
