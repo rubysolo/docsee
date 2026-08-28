@@ -668,8 +668,28 @@ fn rotate_image(image: DynamicImage, angle: u32) -> DynamicImage {
 }
 
 /// Largest dimension of the image used for the orientation vote
-/// (~100 DPI on a US-Letter page).
-const DETECT_MAX_DIM: u32 = 1000;
+/// (~160 DPI on a US-Letter page).
+///
+/// The vote reads text to decide which way is up, so the probe has to be
+/// legible. At 1000 it isn't, for the documents that most need the answer: a
+/// 10x15in scan downscales to 667x1000, where tesseract scores **25-45 at every
+/// angle** — pure noise, and the correct angle survives only by winning a
+/// tie-break. Measured on a 4-page scanned form, correct-angle confidence by
+/// probe size:
+///
+/// | probe | correct-angle confidence |
+/// |-------|--------------------------|
+/// | 1000  | 25 / 45 / 35 / 25        |
+/// | 1600  | 69 / 72 / 65 / 72        |
+/// | 2400  | 69 / 79 / 73 / 77        |
+///
+/// 1600 is where dense scans clear [`MIN_ORIENTATION_CONFIDENCE`] on their own
+/// merits instead of relying on the floor to rescue them; 2400 buys a few more
+/// points for another 50% of the time. It costs real work — the vote is four
+/// OCR passes and 1600 is 2.56x the pixels of 1000 — but callers that reuse the
+/// answer via [`Engine::render_pages_png_with_rotations`] now run the vote once
+/// per document instead of once per render, which more than covers it.
+const DETECT_MAX_DIM: u32 = 1600;
 
 /// Mean-confidence a non-zero angle must reach before we believe it.
 ///
