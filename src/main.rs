@@ -56,6 +56,7 @@ fn main() -> Result<()> {
                 needs_ocr: false,
                 pages,
                 error: None,
+                ..Default::default()
             },
             Err(e) => Extraction {
                 error: Some(format!("ocr_failed: {e:?}")),
