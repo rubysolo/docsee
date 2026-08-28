@@ -1,6 +1,6 @@
 # Plan 0001 — Per-page extraction timings
 
-Status: **proposed** (2026-08-28).
+Status: **implemented** (2026-08-28), shipped in 0.2.0.
 
 ## Goal
 

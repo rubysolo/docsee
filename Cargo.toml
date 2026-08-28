@@ -1,6 +1,6 @@
 [package]
 name = "docsee"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "PDF and image text extraction: native text via pdfium with tesseract OCR fallback"
 license = "MIT OR Apache-2.0"

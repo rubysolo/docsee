@@ -19,13 +19,15 @@
 //! # }
 //! ```
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use image::{DynamicImage, ImageDecoder, ImageReader};
 use leptess::LepTess;
 use pdfium_render::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::io::Cursor;
 use std::path::Path;
+use std::time::Instant;
 
 // Re-exported so callers can name the type accepted by
 // [`EngineBuilder::assembly_page_size`] without depending on `pdfium-render`.
@@ -57,9 +59,37 @@ pub struct PageText {
     pub text: String,
 }
 
+/// Wall-clock cost of one page's extraction, by phase. Phases that did not run
+/// on this page are `None` — a natively-extracted page has no `ocr`, and a page
+/// whose rotation was supplied by the caller has no `orient`.
+///
+/// The phases do not have to add up to `total_us`: they cover the expensive
+/// work, not every instruction between them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageTiming {
+    pub page: u32,
+    /// Which path produced this page's text.
+    pub extractor: Extractor,
+    /// Offset from the start of the extraction call, in microseconds.
+    pub started_us: u64,
+    /// Total for this page, in microseconds.
+    pub total_us: u64,
+    /// pdfium rasterization to an image. On the image path, the normalization
+    /// that stands in for it (decode, EXIF, alpha-over-white).
+    pub render_us: Option<u64>,
+    /// Orientation vote ([`EngineBuilder::auto_rotate`]) — up to four
+    /// tesseract passes, and usually the dominant cost of an OCR page.
+    pub orient_us: Option<u64>,
+    /// PNG encode of the page image, including the rotation applied to it.
+    pub encode_us: Option<u64>,
+    /// The tesseract pass that produced the text.
+    pub ocr_us: Option<u64>,
+}
+
 /// Result of extracting one file. `extractor` is `None` when no extraction
 /// path succeeded (see `error`).
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Extraction {
     pub extractor: Option<Extractor>,
     pub n_pages: u32,
@@ -79,6 +109,22 @@ pub struct Extraction {
     /// second time for an answer it already has.
     #[serde(default)]
     pub page_rotations: Vec<u32>,
+    /// Per-page cost breakdown, in page order. Always populated by
+    /// [`Engine::extract`] and [`Engine::extract_with_hint`].
+    ///
+    /// This is what makes a slow file legible: an OCR page splits into
+    /// rasterization, the orientation vote, the PNG encode and the tesseract
+    /// pass, which differ by an order of magnitude and have completely
+    /// different fixes.
+    #[serde(default)]
+    pub timings: Vec<PageTiming>,
+    /// Total wall clock for the whole `extract` call, in microseconds.
+    /// Includes document open, the type sniff, and — when the native path was
+    /// tried and rejected — the cost of that abandoned attempt, which no page
+    /// timing covers. So `sum(timings.total_us) <= total_us`, and the
+    /// difference is the per-document overhead.
+    #[serde(default)]
+    pub total_us: u64,
 }
 
 /// One page selected from a source PDF for re-packaging via
@@ -89,6 +135,22 @@ pub struct PageRef<'a> {
     pub path: &'a Path,
     /// 1-based page number within that PDF.
     pub page_number: u16,
+}
+
+thread_local! {
+    /// Set while this thread owns a live [`Engine`].
+    ///
+    /// pdfium holds a process-wide lock for the lifetime of a binding, so a
+    /// second engine cannot be built until the first is dropped. From another
+    /// thread that is an ordinary wait; on a thread that already owns one it
+    /// never ends, because the only thread that could release the lock is the
+    /// one blocked on it. This flag lets [`EngineBuilder::build`] recognize
+    /// that case and fail instead of hanging.
+    ///
+    /// A thread-local is sound here precisely because `Engine` is `!Send`
+    /// (pdfium's bindings are, with or without `thread-safe-pdfium`): an engine
+    /// is always dropped on the thread that built it, so the flag cannot drift.
+    static ENGINE_LIVE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Configures and builds an [`Engine`]. Created via [`Engine::builder`].
@@ -175,7 +237,20 @@ impl EngineBuilder {
     /// override, `$PDFIUM_LIB_DIR`, `./lib` next to the executable, `./lib`
     /// under the cwd, then the system library path. tesseract uses the default
     /// tessdata location (`$TESSDATA_PREFIX` to override).
+    ///
+    /// Errors if this thread already has a live [`Engine`] — see that type for
+    /// why building a second one there could only hang.
     pub fn build(self) -> Result<Engine> {
+        if ENGINE_LIVE.get() {
+            bail!(
+                "this thread already has a live Engine; pdfium holds a \
+                 process-wide lock for the lifetime of a binding, so building a \
+                 second one here would block until the first is dropped — which \
+                 this thread cannot do while it is blocked. Drop the existing \
+                 Engine first, or share it rather than building another."
+            );
+        }
+
         let mut candidates: Vec<String> = Vec::new();
         if let Some(dir) = &self.pdfium_lib_dir {
             candidates.push(dir.clone());
@@ -219,6 +294,9 @@ impl EngineBuilder {
             )
         })?;
 
+        // Last: every `?` above leaves the claim unset, so a failed build does
+        // not lock this thread out of trying again.
+        ENGINE_LIVE.set(true);
         Ok(Engine {
             pdfium: Pdfium::new(bindings),
             ocr,
@@ -235,6 +313,30 @@ impl EngineBuilder {
     }
 }
 
+/// What one OCR run over a document produced. Internal: its parts reach
+/// callers on [`Extraction`], which is where they are useful.
+struct OcrRun {
+    pages: Vec<PageText>,
+    chars: usize,
+    rotations: Vec<u32>,
+    timings: Vec<PageTiming>,
+}
+
+/// A bound libpdfium plus a live tesseract instance.
+///
+/// **One live engine per process.** pdfium holds a process-wide lock for the
+/// lifetime of a binding, so a second engine cannot be built until the first is
+/// dropped. From another thread [`EngineBuilder::build`] simply blocks until
+/// that happens; on a thread that already owns an engine it would block forever
+/// — the only thread that could release the lock is the one waiting on it — so
+/// `build` recognizes that case and returns an error instead of hanging. The
+/// `thread-safe-pdfium` feature does not change any of this: it wraps FFI calls
+/// in a lock, not the library init.
+///
+/// Build an engine, keep it, and drop it before building a replacement. A host
+/// serving concurrent work should share one engine behind its own mutex (the
+/// extraction methods take `&mut self` anyway) rather than pool several — a
+/// pool cannot run in parallel here, it can only queue on construction.
 pub struct Engine {
     pdfium: Pdfium,
     ocr: LepTess,
@@ -243,6 +345,14 @@ pub struct Engine {
     auto_rotate: bool,
     assembly_page_size: PdfPagePaperSize,
     orientation_probe_dim: u32,
+}
+
+impl Drop for Engine {
+    /// Releases this thread's claim. Dropping the fields is what releases
+    /// pdfium's own lock, and so what actually unblocks anyone waiting on it.
+    fn drop(&mut self) {
+        ENGINE_LIVE.set(false);
+    }
 }
 
 impl Engine {
@@ -259,41 +369,69 @@ impl Engine {
 
     /// Native (non-OCR) text extraction via pdfium.
     pub fn extract_pdf_native(&mut self, path: &Path) -> Result<(Vec<PageText>, usize)> {
+        let (pages, total, _timings) = self.extract_pdf_native_timed(path, Instant::now())?;
+        Ok((pages, total))
+    }
+
+    /// [`extract_pdf_native`](Self::extract_pdf_native), also reporting what
+    /// each page cost.
+    ///
+    /// `start` is the instant the whole extraction began, so
+    /// [`PageTiming::started_us`] places each page within that call rather than
+    /// within this method. The document open that precedes the loop is
+    /// deliberately outside every page timing; it shows up only in the
+    /// difference against [`Extraction::total_us`].
+    fn extract_pdf_native_timed(
+        &mut self,
+        path: &Path,
+        start: Instant,
+    ) -> Result<(Vec<PageText>, usize, Vec<PageTiming>)> {
         let doc = self
             .pdfium
             .load_pdf_from_file(path, None)
             .context("pdfium failed to open document")?;
         let mut pages = Vec::new();
+        let mut timings = Vec::new();
         let mut total = 0;
         for (i, page) in doc.pages().iter().enumerate() {
+            let started_us = elapsed_us(start);
+            let page_start = Instant::now();
             // pdfium emits \r\n line breaks; normalize to \n
             let text = page
                 .text()
                 .map(|t| t.all().replace("\r\n", "\n").replace('\r', "\n"))
                 .unwrap_or_default();
             total += text.chars().count();
+            timings.push(PageTiming {
+                page: (i + 1) as u32,
+                extractor: Extractor::Native,
+                started_us,
+                total_us: elapsed_us(page_start),
+                render_us: None,
+                orient_us: None,
+                encode_us: None,
+                ocr_us: None,
+            });
             pages.push(PageText {
                 page: (i + 1) as u32,
                 text,
             });
         }
-        Ok((pages, total))
+        Ok((pages, total, timings))
     }
 
     /// Render each PDF page via pdfium and OCR the bitmap with tesseract.
     pub fn extract_pdf_ocr(&mut self, path: &Path, dpi: f32) -> Result<(Vec<PageText>, usize)> {
-        let (pages, total, _rotations) = self.extract_pdf_ocr_rotations(path, dpi)?;
-        Ok((pages, total))
+        let run = self.extract_pdf_ocr_run(path, dpi, Instant::now())?;
+        Ok((run.pages, run.chars))
     }
 
     /// [`extract_pdf_ocr`](Self::extract_pdf_ocr), also reporting the rotation
-    /// auto-rotate applied to each page. Private because the angles reach
-    /// callers on [`Extraction::page_rotations`], which is where they are useful.
-    fn extract_pdf_ocr_rotations(
-        &mut self,
-        path: &Path,
-        dpi: f32,
-    ) -> Result<(Vec<PageText>, usize, Vec<u32>)> {
+    /// auto-rotate applied to each page and what each page cost. Private
+    /// because both reach callers on [`Extraction`], which is where they are
+    /// useful. `start` carries the same meaning as in
+    /// [`extract_pdf_native_timed`](Self::extract_pdf_native_timed).
+    fn extract_pdf_ocr_run(&mut self, path: &Path, dpi: f32, start: Instant) -> Result<OcrRun> {
         let doc = self
             .pdfium
             .load_pdf_from_file(path, None)
@@ -302,9 +440,12 @@ impl Engine {
 
         let mut pages = Vec::new();
         let mut rotations = Vec::new();
+        let mut timings = Vec::new();
         let mut total = 0;
         for (i, page) in doc.pages().iter().enumerate() {
-            let (png, angle) = render_page_to_png(
+            let started_us = elapsed_us(start);
+            let page_start = Instant::now();
+            let rendered = render_page_to_png(
                 &mut self.ocr,
                 self.auto_rotate,
                 &page,
@@ -313,15 +454,34 @@ impl Engine {
                 self.orientation_probe_dim,
             )
             .with_context(|| format!("render failed on page {}", i + 1))?;
-            let text = ocr_png_bytes(&mut self.ocr, &png, dpi as i32)?;
+
+            let ocr_start = Instant::now();
+            let text = ocr_png_bytes(&mut self.ocr, &rendered.png, dpi as i32)?;
+            let ocr_us = elapsed_us(ocr_start);
+
             total += text.chars().count();
-            rotations.push(angle);
+            rotations.push(rendered.angle);
+            timings.push(PageTiming {
+                page: (i + 1) as u32,
+                extractor: Extractor::OcrPdf,
+                started_us,
+                total_us: elapsed_us(page_start),
+                render_us: Some(rendered.render_us),
+                orient_us: rendered.orient_us,
+                encode_us: Some(rendered.encode_us),
+                ocr_us: Some(ocr_us),
+            });
             pages.push(PageText {
                 page: (i + 1) as u32,
                 text,
             });
         }
-        Ok((pages, total, rotations))
+        Ok(OcrRun {
+            pages,
+            chars: total,
+            rotations,
+            timings,
+        })
     }
 
     /// Render every PDF page to PNG bytes at `dpi`, honoring the engine's
@@ -362,7 +522,7 @@ impl Engine {
         let mut out = Vec::with_capacity(doc.pages().len() as usize);
         for (i, page) in doc.pages().iter().enumerate() {
             let known = rotations.get(i).copied();
-            let (png, _angle) = render_page_to_png(
+            let rendered = render_page_to_png(
                 &mut self.ocr,
                 self.auto_rotate,
                 &page,
@@ -371,7 +531,7 @@ impl Engine {
                 self.orientation_probe_dim,
             )
             .with_context(|| format!("render failed on page {}", i + 1))?;
-            out.push(png);
+            out.push(rendered.png);
         }
         Ok(out)
     }
@@ -444,7 +604,7 @@ impl Engine {
             .pages()
             .get(page_number.saturating_sub(1))
             .with_context(|| format!("no page {page_number} in document"))?;
-        let (png, _angle) = render_page_to_png(
+        let rendered = render_page_to_png(
             &mut self.ocr,
             self.auto_rotate,
             &page,
@@ -452,7 +612,7 @@ impl Engine {
             rotation,
             self.orientation_probe_dim,
         )?;
-        Ok(png)
+        Ok(rendered.png)
     }
 
     /// Re-package selected pages from one or more sources into a single new PDF.
@@ -507,43 +667,96 @@ impl Engine {
     /// OCR an image file after normalizing it (EXIF orientation applied,
     /// converted to RGB).
     pub fn extract_image_ocr(&mut self, path: &Path) -> Result<(Vec<PageText>, usize)> {
-        let (pages, chars, _rotation) = self.extract_image_ocr_rotation(path)?;
-        Ok((pages, chars))
+        let run = self.extract_image_ocr_run(path, Instant::now())?;
+        Ok((run.pages, run.chars))
     }
 
     /// [`extract_image_ocr`](Self::extract_image_ocr), also reporting the
-    /// rotation auto-rotate applied. Private for the same reason as
-    /// `extract_pdf_ocr_rotations`: the angle reaches callers on
-    /// [`Extraction::page_rotations`].
-    fn extract_image_ocr_rotation(&mut self, path: &Path) -> Result<(Vec<PageText>, usize, u32)> {
-        let (text, chars, rotation) = if self.auto_rotate {
+    /// rotation auto-rotate applied and what the page cost. Private for the
+    /// same reason as `extract_pdf_ocr_run`: both reach callers on
+    /// [`Extraction`].
+    ///
+    /// An image is one page, so this emits exactly one [`PageTiming`]. Nothing
+    /// is rasterized here, so `render_us` times the normalization that stands
+    /// in for it — the decode-and-flatten that produces the image both the vote
+    /// and the OCR pass read.
+    fn extract_image_ocr_run(&mut self, path: &Path, start: Instant) -> Result<OcrRun> {
+        let started_us = elapsed_us(start);
+        let page_start = Instant::now();
+        let mut orient_us = None;
+        let mut encode_us = None;
+
+        let (text, rotation, render_us, ocr_us) = if self.auto_rotate {
+            let render_start = Instant::now();
             let image = normalize_image_for_ocr(path).or_else(|_| {
                 let bytes = std::fs::read(path).context("read image file")?;
                 image::load_from_memory(&bytes).context("load image from memory")
             })?;
+            let render_us = elapsed_us(render_start);
+
+            let orient_start = Instant::now();
             let angle = detect_orientation(&mut self.ocr, &image, self.orientation_probe_dim)?;
-            let rotated = rotate_image(image, angle);
-            let mut png = Vec::new();
-            rotated
-                .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
-                .context("PNG encode failed")?;
+            orient_us = Some(elapsed_us(orient_start));
+
+            let encode_start = Instant::now();
+            let png = encode_png(&rotate_image(image, angle))?;
+            encode_us = Some(elapsed_us(encode_start));
+
+            let ocr_start = Instant::now();
             let text = ocr_bytes(&mut self.ocr, &png)?;
-            let chars = text.chars().count();
-            (text, chars, angle)
+            (text, angle, render_us, elapsed_us(ocr_start))
         } else {
-            let text = match normalize_image_for_ocr_png(path) {
-                Ok(png) => ocr_bytes(&mut self.ocr, &png)?,
+            let render_start = Instant::now();
+            let normalized = normalize_image_for_ocr(path);
+            let render_us = elapsed_us(render_start);
+
+            let png = match normalized {
+                Ok(image) => {
+                    let encode_start = Instant::now();
+                    let png = encode_png(&image);
+                    encode_us = Some(elapsed_us(encode_start));
+                    png
+                }
+                Err(normalize_err) => Err(normalize_err),
+            };
+
+            let (text, ocr_us) = match png {
+                Ok(png) => {
+                    let ocr_start = Instant::now();
+                    let text = ocr_bytes(&mut self.ocr, &png)?;
+                    (text, elapsed_us(ocr_start))
+                }
+                // Normalization is a convenience, not a requirement: hand the
+                // raw file to tesseract rather than fail on something `image`
+                // could not decode.
                 Err(normalize_err) => {
                     let bytes = std::fs::read(path).context("read image file")?;
-                    ocr_bytes(&mut self.ocr, &bytes).with_context(|| {
+                    let ocr_start = Instant::now();
+                    let text = ocr_bytes(&mut self.ocr, &bytes).with_context(|| {
                         format!("image normalization failed first: {normalize_err:?}")
-                    })?
+                    })?;
+                    (text, elapsed_us(ocr_start))
                 }
             };
-            let chars = text.chars().count();
-            (text, chars, 0)
+            (text, 0, render_us, ocr_us)
         };
-        Ok((vec![PageText { page: 1, text }], chars, rotation))
+
+        let chars = text.chars().count();
+        Ok(OcrRun {
+            pages: vec![PageText { page: 1, text }],
+            chars,
+            rotations: vec![rotation],
+            timings: vec![PageTiming {
+                page: 1,
+                extractor: Extractor::OcrImage,
+                started_us,
+                total_us: elapsed_us(page_start),
+                render_us: Some(render_us),
+                orient_us,
+                encode_us,
+                ocr_us: Some(ocr_us),
+            }],
+        })
     }
 
     /// Extract one file, detecting its type automatically: images (by
@@ -559,29 +772,34 @@ impl Engine {
     /// is known from a MIME type rather than the file name). Content sniffing
     /// still catches images with misleading names.
     pub fn extract_with_hint(&mut self, path: &Path, treat_as_image: bool) -> Extraction {
+        // Before the sniff: the type detection is part of what the call cost.
+        let start = Instant::now();
         let mut out = Extraction::default();
 
         if treat_as_image || sniffs_as_image(path) {
-            match self.extract_image_ocr_rotation(path) {
-                Ok((pages, chars, rotation)) => {
+            match self.extract_image_ocr_run(path, start) {
+                Ok(run) => {
                     out.extractor = Some(Extractor::OcrImage);
                     out.n_pages = 1;
-                    out.extracted_chars = chars;
-                    out.pages = pages;
-                    out.page_rotations = vec![rotation];
+                    out.extracted_chars = run.chars;
+                    out.pages = run.pages;
+                    out.page_rotations = run.rotations;
+                    out.timings = run.timings;
                 }
                 Err(e) => out.error = Some(format!("image_ocr_failed: {e:?}")),
             }
+            out.total_us = elapsed_us(start);
             return out;
         }
 
-        match self.extract_pdf_native(path) {
-            Ok((pages, chars)) => {
+        match self.extract_pdf_native_timed(path, start) {
+            Ok((pages, chars, timings)) => {
                 out.extractor = Some(Extractor::Native);
                 out.n_pages = pages.len() as u32;
                 out.extracted_chars = chars;
                 out.needs_ocr = chars < self.min_chars_per_page * pages.len().max(1);
                 out.pages = pages;
+                out.timings = timings;
             }
             Err(e) => {
                 out.error = Some(format!("pdf_native_failed: {e:?}"));
@@ -590,13 +808,16 @@ impl Engine {
         }
 
         if out.needs_ocr {
-            match self.extract_pdf_ocr_rotations(path, self.ocr_dpi) {
-                Ok((pages, chars, rotations)) => {
+            match self.extract_pdf_ocr_run(path, self.ocr_dpi, start) {
+                Ok(run) => {
                     out.extractor = Some(Extractor::OcrPdf);
-                    out.n_pages = pages.len() as u32;
-                    out.extracted_chars = chars;
-                    out.pages = pages;
-                    out.page_rotations = rotations;
+                    out.n_pages = run.pages.len() as u32;
+                    out.extracted_chars = run.chars;
+                    out.pages = run.pages;
+                    out.page_rotations = run.rotations;
+                    // The native attempt's timings describe text that was
+                    // thrown away; only its cost survives, in `total_us`.
+                    out.timings = run.timings;
                     out.needs_ocr = false;
                     out.error = None; // OCR rescued us
                 }
@@ -608,13 +829,31 @@ impl Engine {
             }
         }
 
+        out.total_us = elapsed_us(start);
         out
     }
 }
 
+/// One rendered page: the bytes, the angle applied, and what each phase cost.
+///
+/// The timings are returned rather than written into the engine because
+/// [`render_page_to_png`] is a free function holding a disjoint borrow of
+/// `Engine::ocr` — it has no `self` to write to.
+struct RenderedPage {
+    png: Vec<u8>,
+    /// The rotation applied, so a caller that renders the same page again can
+    /// reuse the answer instead of re-deriving it.
+    angle: u32,
+    /// pdfium rasterization.
+    render_us: u64,
+    /// The orientation vote; `None` when the angle was known or auto-rotate is
+    /// off, which is exactly the cost that reuse avoids.
+    orient_us: Option<u64>,
+    /// Rotation of the full-resolution image plus its PNG encode.
+    encode_us: u64,
+}
+
 /// Render one pdfium page to PNG bytes, applying auto-rotation when enabled.
-/// Returns the bytes and the angle applied, so a caller that renders the same
-/// page again can reuse the answer instead of re-deriving it.
 ///
 /// `known_angle` short-circuits detection: `Some(a)` rotates by `a` without
 /// consulting tesseract at all. Orientation is a property of the page's
@@ -633,24 +872,50 @@ fn render_page_to_png(
     config: &PdfRenderConfig,
     known_angle: Option<u32>,
     probe_dim: u32,
-) -> Result<(Vec<u8>, u32)> {
+) -> Result<RenderedPage> {
+    let render_start = Instant::now();
     let bitmap = page
         .render_with_config(config)
         .context("pdfium render failed")?;
-    let mut image = bitmap.as_image();
+    let image = bitmap.as_image();
+    let render_us = elapsed_us(render_start);
 
-    let angle = match known_angle {
-        Some(angle) => angle,
-        None if auto_rotate => detect_orientation(ocr, &image, probe_dim)?,
-        None => 0,
+    let (angle, orient_us) = match known_angle {
+        Some(angle) => (angle, None),
+        None if auto_rotate => {
+            let orient_start = Instant::now();
+            let angle = detect_orientation(ocr, &image, probe_dim)?;
+            (angle, Some(elapsed_us(orient_start)))
+        }
+        None => (0, None),
     };
-    image = rotate_image(image, angle);
 
+    let encode_start = Instant::now();
+    let png = encode_png(&rotate_image(image, angle))?;
+    let encode_us = elapsed_us(encode_start);
+
+    Ok(RenderedPage {
+        png,
+        angle,
+        render_us,
+        orient_us,
+        encode_us,
+    })
+}
+
+/// Microseconds elapsed since `since`, saturating well past any plausible
+/// extraction (u64 microseconds is ~584,000 years).
+fn elapsed_us(since: Instant) -> u64 {
+    since.elapsed().as_micros() as u64
+}
+
+/// PNG-encode an in-memory image.
+fn encode_png(image: &DynamicImage) -> Result<Vec<u8>> {
     let mut png = Vec::new();
     image
         .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
         .context("PNG encode failed")?;
-    Ok((png, angle))
+    Ok(png)
 }
 
 /// Default page size for image sources embedded by [`Engine::assemble_pdf`]:
@@ -834,12 +1099,7 @@ fn ocr_bytes(ocr: &mut LepTess, bytes: &[u8]) -> Result<String> {
 }
 
 fn normalize_image_for_ocr_png(path: &Path) -> Result<Vec<u8>> {
-    let image = normalize_image_for_ocr(path)?;
-    let mut png = Vec::new();
-    image
-        .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
-        .context("PNG re-encode failed")?;
-    Ok(png)
+    encode_png(&normalize_image_for_ocr(path)?)
 }
 
 fn normalize_image_for_ocr(path: &Path) -> Result<DynamicImage> {
