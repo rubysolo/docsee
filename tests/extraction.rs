@@ -141,3 +141,157 @@ fn extraction_serializes_with_snake_case_labels() {
     assert_eq!(back.extractor, Some(Extractor::Native));
     assert_eq!(back.n_pages, result.n_pages);
 }
+
+// ---------------------------------------------------------------------------
+// Per-page timings.
+//
+// These assert structure and presence only — never a duration. A test that
+// asserts a number of microseconds is a flaky test on someone else's CI.
+
+/// The invariants that hold on every path: one timing per page, in page order,
+/// each starting no earlier than the last, and all of them fitting inside the
+/// call's own wall clock (the slack is document open, the type sniff, and any
+/// abandoned native attempt).
+fn assert_timings_are_coherent(result: &Extraction) {
+    assert_eq!(
+        result.timings.len(),
+        result.n_pages as usize,
+        "one timing per page"
+    );
+
+    let mut previous_start = 0;
+    for (i, t) in result.timings.iter().enumerate() {
+        assert_eq!(t.page, (i + 1) as u32, "timings are in page order");
+        assert!(
+            t.started_us >= previous_start,
+            "page {} starts before page {} did",
+            t.page,
+            i
+        );
+        previous_start = t.started_us;
+    }
+
+    let in_pages: u64 = result.timings.iter().map(|t| t.total_us).sum();
+    assert!(
+        in_pages <= result.total_us,
+        "pages account for {in_pages}us of a {}us call",
+        result.total_us
+    );
+}
+
+#[test]
+fn native_pages_are_timed_with_no_ocr_phases() {
+    let mut engine = Engine::new().unwrap();
+    let result = engine.extract(&fixture("multipage.pdf"));
+
+    assert_eq!(result.extractor, Some(Extractor::Native));
+    assert_timings_are_coherent(&result);
+
+    for t in &result.timings {
+        assert_eq!(t.extractor, Extractor::Native);
+        // Nothing was rasterized, rotated, encoded or OCR'd.
+        assert_eq!(t.render_us, None);
+        assert_eq!(t.orient_us, None);
+        assert_eq!(t.encode_us, None);
+        assert_eq!(t.ocr_us, None);
+    }
+}
+
+#[test]
+fn ocr_pages_are_timed_by_phase() {
+    let mut engine = Engine::new().unwrap();
+    let result = engine.extract(&fixture("scanned.pdf"));
+
+    assert_eq!(result.extractor, Some(Extractor::OcrPdf));
+    assert_timings_are_coherent(&result);
+
+    for t in &result.timings {
+        assert_eq!(t.extractor, Extractor::OcrPdf);
+        assert!(t.render_us.is_some(), "the page was rasterized");
+        assert!(t.encode_us.is_some(), "the page image was encoded");
+        assert!(t.ocr_us.is_some(), "the page was OCR'd");
+        // Auto-rotate is off, so no vote ran.
+        assert_eq!(t.orient_us, None);
+    }
+}
+
+#[test]
+fn the_orientation_vote_is_timed_only_when_it_runs() {
+    // The regression guard for the rotation work: the vote is up to four extra
+    // tesseract passes per page, so if a future change reintroduces one where
+    // it isn't wanted — or drops one that is — the difference shows up here
+    // rather than as an unexplained slowdown in someone's queue.
+    //
+    // Each engine gets its own scope: only one `Engine` can be alive at a time
+    // (see `Engine`'s docs), so the first must be dropped before the second is
+    // built.
+    let rotating = {
+        let mut engine = Engine::builder().auto_rotate(true).build().unwrap();
+        engine.extract(&fixture("scanned.pdf"))
+    };
+
+    assert_eq!(rotating.extractor, Some(Extractor::OcrPdf));
+    assert_timings_are_coherent(&rotating);
+    for t in &rotating.timings {
+        assert!(
+            t.orient_us.is_some(),
+            "auto-rotate is on, so page {} was voted on",
+            t.page
+        );
+    }
+
+    let plain = {
+        let mut engine = Engine::new().unwrap();
+        engine.extract(&fixture("scanned.pdf"))
+    };
+    assert!(plain.timings.iter().all(|t| t.orient_us.is_none()));
+}
+
+#[test]
+fn an_image_yields_one_timing() {
+    let mut engine = Engine::new().unwrap();
+    let result = engine.extract(&fixture("sample.png"));
+
+    assert_eq!(result.extractor, Some(Extractor::OcrImage));
+    assert_timings_are_coherent(&result);
+
+    let t = &result.timings[0];
+    assert_eq!(t.extractor, Extractor::OcrImage);
+    assert_eq!(t.page, 1);
+    // Normalization stands in for the rasterization a PDF page would need.
+    assert!(t.render_us.is_some());
+    assert!(t.encode_us.is_some());
+    assert!(t.ocr_us.is_some());
+    assert_eq!(t.orient_us, None, "auto-rotate is off");
+}
+
+#[test]
+fn timings_survive_a_serde_round_trip() {
+    let mut engine = Engine::new().unwrap();
+    let result = engine.extract(&fixture("scanned.pdf"));
+
+    let json = serde_json::to_string(&result).unwrap();
+    let back: Extraction = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.timings.len(), result.timings.len());
+    assert_eq!(back.total_us, result.total_us);
+    assert_eq!(back.timings[0].ocr_us, result.timings[0].ocr_us);
+}
+
+#[test]
+fn records_written_before_timings_existed_still_deserialize() {
+    // A 0.1.x `--json` record, or anything an embedder archived from one.
+    let legacy = r#"{
+        "extractor": "native",
+        "n_pages": 1,
+        "extracted_chars": 44,
+        "needs_ocr": false,
+        "pages": [{"page": 1, "text": "hello"}],
+        "error": null
+    }"#;
+
+    let back: Extraction = serde_json::from_str(legacy).unwrap();
+    assert_eq!(back.extractor, Some(Extractor::Native));
+    assert!(back.timings.is_empty());
+    assert_eq!(back.total_us, 0);
+}
