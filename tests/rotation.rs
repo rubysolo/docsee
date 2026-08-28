@@ -286,3 +286,49 @@ fn single_page_render_accepts_a_known_rotation() -> anyhow::Result<()> {
     assert_eq!(detected, reused);
     Ok(())
 }
+
+#[test]
+fn a_tiny_orientation_probe_finds_no_evidence() -> anyhow::Result<()> {
+    // The knob has to be observable, or it's decoration. The vote reads text to
+    // decide which way is up, so starving it of pixels must cost it the answer:
+    // `test_auto_rotate_180` above shows the default probe correcting this same
+    // fixture, and here a probe too small to read anything leaves it alone.
+    //
+    // Split across two tests rather than asserted in one on purpose: building a
+    // second Engine in the same process deadlocks in `FPDF_InitLibrary`, which
+    // takes a process-global lock the first engine never releases. One engine
+    // per test, as everywhere else in this file.
+    let mut engine = Engine::builder()
+        .auto_rotate(true)
+        .orientation_probe_dim(32)
+        .build()?;
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rotated_180.png");
+
+    assert_eq!(
+        engine.extract(&fixture).page_rotations,
+        vec![0],
+        "a 32px probe cannot read anything, so the vote should find no evidence \
+         and leave the page alone"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_zero_probe_dim_does_not_panic() -> anyhow::Result<()> {
+    // `image::resize` to a zero dimension panics; 0 is clamped to 1 so a caller
+    // asking for "as small as possible" gets a useless vote, not a crash.
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rotated_180.png");
+    let mut engine = Engine::builder()
+        .auto_rotate(true)
+        .orientation_probe_dim(0)
+        .build()?;
+
+    let result = engine.extract(&fixture);
+
+    assert!(
+        result.error.is_none(),
+        "extraction errored: {:?}",
+        result.error
+    );
+    Ok(())
+}
