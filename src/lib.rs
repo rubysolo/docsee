@@ -67,6 +67,18 @@ pub struct Extraction {
     pub needs_ocr: bool,
     pub pages: Vec<PageText>,
     pub error: Option<String>,
+    /// Rotation, in degrees clockwise (0, 90, 180 or 270), that auto-rotate
+    /// applied to each page before OCR — in page order, index 0 = page 1.
+    ///
+    /// Empty when auto-rotate is off, and when the native text path answered
+    /// (nothing was rasterized, so nothing was rotated). Detecting orientation
+    /// is the dominant cost of an OCR pass — up to four extra tesseract runs per
+    /// page — so a caller that renders the same pages afterwards (for
+    /// thumbnails, say) should feed these back through
+    /// [`Engine::render_pages_png_with_rotations`] rather than pay the vote a
+    /// second time for an answer it already has.
+    #[serde(default)]
+    pub page_rotations: Vec<u32>,
 }
 
 /// One page selected from a source PDF for re-packaging via
@@ -246,6 +258,18 @@ impl Engine {
 
     /// Render each PDF page via pdfium and OCR the bitmap with tesseract.
     pub fn extract_pdf_ocr(&mut self, path: &Path, dpi: f32) -> Result<(Vec<PageText>, usize)> {
+        let (pages, total, _rotations) = self.extract_pdf_ocr_rotations(path, dpi)?;
+        Ok((pages, total))
+    }
+
+    /// [`extract_pdf_ocr`](Self::extract_pdf_ocr), also reporting the rotation
+    /// auto-rotate applied to each page. Private because the angles reach
+    /// callers on [`Extraction::page_rotations`], which is where they are useful.
+    fn extract_pdf_ocr_rotations(
+        &mut self,
+        path: &Path,
+        dpi: f32,
+    ) -> Result<(Vec<PageText>, usize, Vec<u32>)> {
         let doc = self
             .pdfium
             .load_pdf_from_file(path, None)
@@ -253,18 +277,21 @@ impl Engine {
         let config = PdfRenderConfig::new().scale_page_by_factor(dpi / 72.0);
 
         let mut pages = Vec::new();
+        let mut rotations = Vec::new();
         let mut total = 0;
         for (i, page) in doc.pages().iter().enumerate() {
-            let png = render_page_to_png(&mut self.ocr, self.auto_rotate, &page, &config)
-                .with_context(|| format!("render failed on page {}", i + 1))?;
+            let (png, angle) =
+                render_page_to_png(&mut self.ocr, self.auto_rotate, &page, &config, None)
+                    .with_context(|| format!("render failed on page {}", i + 1))?;
             let text = ocr_png_bytes(&mut self.ocr, &png, dpi as i32)?;
             total += text.chars().count();
+            rotations.push(angle);
             pages.push(PageText {
                 page: (i + 1) as u32,
                 text,
             });
         }
-        Ok((pages, total))
+        Ok((pages, total, rotations))
     }
 
     /// Render every PDF page to PNG bytes at `dpi`, honoring the engine's
@@ -275,6 +302,27 @@ impl Engine {
     /// than its OCR text. `dpi` trades size for sharpness independently of the
     /// OCR DPI; thumbnails typically want less than [`OCR_DPI`].
     pub fn render_pdf_pages_png(&mut self, path: &Path, dpi: f32) -> Result<Vec<Vec<u8>>> {
+        self.render_pdf_pages_png_with_rotations(path, dpi, &[])
+    }
+
+    /// [`render_pdf_pages_png`](Self::render_pdf_pages_png), reusing rotations
+    /// already known for these pages instead of detecting them again.
+    ///
+    /// `rotations` is in page order (index 0 = page 1) — pass
+    /// [`Extraction::page_rotations`] straight through. Pages it doesn't cover
+    /// fall back to the engine's normal behavior, so a short or empty slice is
+    /// safe and `&[]` is exactly [`render_pdf_pages_png`](Self::render_pdf_pages_png).
+    ///
+    /// This exists because rendering the same pages twice — once to OCR them,
+    /// once for thumbnails — otherwise runs the orientation vote twice, and the
+    /// vote is up to four tesseract passes per page. The angle does not depend
+    /// on `dpi`, so the second answer can only agree with the first.
+    pub fn render_pdf_pages_png_with_rotations(
+        &mut self,
+        path: &Path,
+        dpi: f32,
+        rotations: &[u32],
+    ) -> Result<Vec<Vec<u8>>> {
         let doc = self
             .pdfium
             .load_pdf_from_file(path, None)
@@ -283,10 +331,11 @@ impl Engine {
 
         let mut out = Vec::with_capacity(doc.pages().len() as usize);
         for (i, page) in doc.pages().iter().enumerate() {
-            out.push(
-                render_page_to_png(&mut self.ocr, self.auto_rotate, &page, &config)
-                    .with_context(|| format!("render failed on page {}", i + 1))?,
-            );
+            let known = rotations.get(i).copied();
+            let (png, _angle) =
+                render_page_to_png(&mut self.ocr, self.auto_rotate, &page, &config, known)
+                    .with_context(|| format!("render failed on page {}", i + 1))?;
+            out.push(png);
         }
         Ok(out)
     }
@@ -298,10 +347,28 @@ impl Engine {
     /// index 0 = page 1. This is the high-level entry thumbnail callers want —
     /// one call regardless of whether the upload was a scan or a photo.
     pub fn render_pages_png(&mut self, path: &Path, dpi: f32) -> Result<Vec<Vec<u8>>> {
+        self.render_pages_png_with_rotations(path, dpi, &[])
+    }
+
+    /// [`render_pages_png`](Self::render_pages_png), reusing rotations already
+    /// known for these pages — see
+    /// [`render_pdf_pages_png_with_rotations`](Self::render_pdf_pages_png_with_rotations).
+    ///
+    /// This is the entry thumbnail callers want: hand it the
+    /// [`Extraction::page_rotations`] from the extract that just ran and the
+    /// render costs a rasterization instead of a rasterization plus an
+    /// orientation vote. `rotations` is ignored for image sources, which are
+    /// normalized rather than rotated (EXIF orientation, alpha flattened).
+    pub fn render_pages_png_with_rotations(
+        &mut self,
+        path: &Path,
+        dpi: f32,
+        rotations: &[u32],
+    ) -> Result<Vec<Vec<u8>>> {
         if has_image_extension(path) || sniffs_as_image(path) {
             Ok(vec![normalize_image_for_ocr_png(path)?])
         } else {
-            self.render_pdf_pages_png(path, dpi)
+            self.render_pdf_pages_png_with_rotations(path, dpi, rotations)
         }
     }
 
@@ -314,6 +381,24 @@ impl Engine {
         page_number: u16,
         dpi: f32,
     ) -> Result<Vec<u8>> {
+        self.render_pdf_page_png_with_rotation(path, page_number, dpi, None)
+    }
+
+    /// [`render_pdf_page_png`](Self::render_pdf_page_png), with the page's
+    /// rotation supplied rather than detected.
+    ///
+    /// `Some(angle)` skips the orientation vote — the render-on-demand
+    /// counterpart to
+    /// [`render_pdf_pages_png_with_rotations`](Self::render_pdf_pages_png_with_rotations),
+    /// for a caller re-rendering one page whose angle it recorded earlier.
+    /// `None` behaves exactly like `render_pdf_page_png`.
+    pub fn render_pdf_page_png_with_rotation(
+        &mut self,
+        path: &Path,
+        page_number: u16,
+        dpi: f32,
+        rotation: Option<u32>,
+    ) -> Result<Vec<u8>> {
         let doc = self
             .pdfium
             .load_pdf_from_file(path, None)
@@ -323,7 +408,9 @@ impl Engine {
             .pages()
             .get(page_number.saturating_sub(1))
             .with_context(|| format!("no page {page_number} in document"))?;
-        render_page_to_png(&mut self.ocr, self.auto_rotate, &page, &config)
+        let (png, _angle) =
+            render_page_to_png(&mut self.ocr, self.auto_rotate, &page, &config, rotation)?;
+        Ok(png)
     }
 
     /// Re-package selected pages from one or more sources into a single new PDF.
@@ -378,7 +465,16 @@ impl Engine {
     /// OCR an image file after normalizing it (EXIF orientation applied,
     /// converted to RGB).
     pub fn extract_image_ocr(&mut self, path: &Path) -> Result<(Vec<PageText>, usize)> {
-        let (text, chars) = if self.auto_rotate {
+        let (pages, chars, _rotation) = self.extract_image_ocr_rotation(path)?;
+        Ok((pages, chars))
+    }
+
+    /// [`extract_image_ocr`](Self::extract_image_ocr), also reporting the
+    /// rotation auto-rotate applied. Private for the same reason as
+    /// `extract_pdf_ocr_rotations`: the angle reaches callers on
+    /// [`Extraction::page_rotations`].
+    fn extract_image_ocr_rotation(&mut self, path: &Path) -> Result<(Vec<PageText>, usize, u32)> {
+        let (text, chars, rotation) = if self.auto_rotate {
             let image = normalize_image_for_ocr(path).or_else(|_| {
                 let bytes = std::fs::read(path).context("read image file")?;
                 image::load_from_memory(&bytes).context("load image from memory")
@@ -391,7 +487,7 @@ impl Engine {
                 .context("PNG encode failed")?;
             let text = ocr_bytes(&mut self.ocr, &png)?;
             let chars = text.chars().count();
-            (text, chars)
+            (text, chars, angle)
         } else {
             let text = match normalize_image_for_ocr_png(path) {
                 Ok(png) => ocr_bytes(&mut self.ocr, &png)?,
@@ -403,9 +499,9 @@ impl Engine {
                 }
             };
             let chars = text.chars().count();
-            (text, chars)
+            (text, chars, 0)
         };
-        Ok((vec![PageText { page: 1, text }], chars))
+        Ok((vec![PageText { page: 1, text }], chars, rotation))
     }
 
     /// Extract one file, detecting its type automatically: images (by
@@ -424,12 +520,13 @@ impl Engine {
         let mut out = Extraction::default();
 
         if treat_as_image || sniffs_as_image(path) {
-            match self.extract_image_ocr(path) {
-                Ok((pages, chars)) => {
+            match self.extract_image_ocr_rotation(path) {
+                Ok((pages, chars, rotation)) => {
                     out.extractor = Some(Extractor::OcrImage);
                     out.n_pages = 1;
                     out.extracted_chars = chars;
                     out.pages = pages;
+                    out.page_rotations = vec![rotation];
                 }
                 Err(e) => out.error = Some(format!("image_ocr_failed: {e:?}")),
             }
@@ -451,12 +548,13 @@ impl Engine {
         }
 
         if out.needs_ocr {
-            match self.extract_pdf_ocr(path, self.ocr_dpi) {
-                Ok((pages, chars)) => {
+            match self.extract_pdf_ocr_rotations(path, self.ocr_dpi) {
+                Ok((pages, chars, rotations)) => {
                     out.extractor = Some(Extractor::OcrPdf);
                     out.n_pages = pages.len() as u32;
                     out.extracted_chars = chars;
                     out.pages = pages;
+                    out.page_rotations = rotations;
                     out.needs_ocr = false;
                     out.error = None; // OCR rescued us
                 }
@@ -473,6 +571,14 @@ impl Engine {
 }
 
 /// Render one pdfium page to PNG bytes, applying auto-rotation when enabled.
+/// Returns the bytes and the angle applied, so a caller that renders the same
+/// page again can reuse the answer instead of re-deriving it.
+///
+/// `known_angle` short-circuits detection: `Some(a)` rotates by `a` without
+/// consulting tesseract at all. Orientation is a property of the page's
+/// content, not of the resolution it was rasterized at, so an angle detected
+/// during an OCR pass stays valid for a later render at a different DPI — and
+/// re-deriving it costs up to four extra OCR runs.
 ///
 /// A free function (rather than a method) on purpose: it borrows `ocr` while
 /// the caller still holds the `PdfDocument` borrowed from `self.pdfium`, the
@@ -483,22 +589,25 @@ fn render_page_to_png(
     auto_rotate: bool,
     page: &PdfPage,
     config: &PdfRenderConfig,
-) -> Result<Vec<u8>> {
+    known_angle: Option<u32>,
+) -> Result<(Vec<u8>, u32)> {
     let bitmap = page
         .render_with_config(config)
         .context("pdfium render failed")?;
     let mut image = bitmap.as_image();
 
-    if auto_rotate {
-        let angle = detect_orientation(ocr, &image)?;
-        image = rotate_image(image, angle);
-    }
+    let angle = match known_angle {
+        Some(angle) => angle,
+        None if auto_rotate => detect_orientation(ocr, &image)?,
+        None => 0,
+    };
+    image = rotate_image(image, angle);
 
     let mut png = Vec::new();
     image
         .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
         .context("PNG encode failed")?;
-    Ok(png)
+    Ok((png, angle))
 }
 
 /// Default page size for image sources embedded by [`Engine::assemble_pdf`]:
@@ -562,6 +671,28 @@ fn rotate_image(image: DynamicImage, angle: u32) -> DynamicImage {
 /// (~100 DPI on a US-Letter page).
 const DETECT_MAX_DIM: u32 = 1000;
 
+/// Mean-confidence a non-zero angle must reach before we believe it.
+///
+/// The vote compares tesseract's `mean_text_conf` across four rotations and
+/// takes the best. On a genuinely rotated page the right angle is unmistakable
+/// — the `rotated_180` fixture scores 26 / 54 / **95**. On an upright page
+/// there is no signal to find and all four land in a noise band, where the
+/// winner is arbitrary: a 4-page upright scan measured 35 / 33 / 27 / **42**,
+/// handing 270 degrees to a page that was already the right way up.
+///
+/// So a bare argmax rotates upright documents on a coin flip. Requiring the
+/// winner to clear this floor keeps the confident corrections and discards the
+/// noise. Set between the two populations, nearer the noise: a real rotation
+/// clears it easily, and anything that doesn't was not evidence.
+const MIN_ORIENTATION_CONFIDENCE: i32 = 60;
+
+/// Extra confidence a non-zero angle must have *over leaving the page alone*.
+///
+/// Belt and braces with the floor above, for a page whose every orientation
+/// scores well: rotating is only worth it if it is clearly better than not
+/// rotating, and 0 degrees is the answer that needs no evidence.
+const MIN_ORIENTATION_MARGIN: i32 = 10;
+
 fn detect_orientation(ocr: &mut LepTess, image: &DynamicImage) -> Result<u32> {
     // Orientation is a coarse best-of-four vote; it doesn't need full OCR
     // resolution. Detection is the dominant OCR cost (up to 4 passes per page
@@ -580,6 +711,7 @@ fn detect_orientation(ocr: &mut LepTess, image: &DynamicImage) -> Result<u32> {
     let angles = [0, 90, 180, 270];
     let mut best_angle = 0;
     let mut best_conf = -1;
+    let mut upright_conf = 0;
 
     for &angle in &angles {
         let rotated = match angle {
@@ -600,6 +732,10 @@ fn detect_orientation(ocr: &mut LepTess, image: &DynamicImage) -> Result<u32> {
         let _ = ocr.get_utf8_text().context("OSD check OCR failed")?;
         let conf = ocr.mean_text_conf();
 
+        if angle == 0 {
+            upright_conf = conf;
+        }
+
         if conf > best_conf {
             best_conf = conf;
             best_angle = angle;
@@ -610,6 +746,18 @@ fn detect_orientation(ocr: &mut LepTess, image: &DynamicImage) -> Result<u32> {
             break;
         }
     }
+
+    // Only act on a win that is actually evidence. Rotating is a destructive
+    // guess — an upright page turned on its side OCRs to noise, losing exactly
+    // the dense small print (serial numbers, dates) that matters most — so the
+    // burden of proof sits on rotating, not on leaving the page alone.
+    if best_angle != 0
+        && (best_conf < MIN_ORIENTATION_CONFIDENCE
+            || best_conf - upright_conf < MIN_ORIENTATION_MARGIN)
+    {
+        return Ok(0);
+    }
+
     Ok(best_angle)
 }
 
