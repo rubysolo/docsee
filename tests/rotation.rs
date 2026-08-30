@@ -390,3 +390,46 @@ fn the_default_width_is_bounded_and_never_zero() {
     let n = docsee::default_ocr_threads();
     assert!((1..=4).contains(&n), "default width out of range: {n}");
 }
+
+#[test]
+fn settling_early_leaves_a_rotated_page_alone() -> anyhow::Result<()> {
+    // The knob has to be observable, or it's decoration. `test_auto_rotate_180`
+    // shows the default correcting this fixture by trying every angle; settling
+    // at the first score instead means the vote never sees the angle that would
+    // have won, and the page keeps the orientation it arrived with.
+    //
+    // That is the documented trade, and this pins its direction: settling early
+    // loses corrections, it does not invent them. One engine per test — a second
+    // in the same process deadlocks in `FPDF_InitLibrary`.
+    let mut engine = Engine::builder()
+        .auto_rotate(true)
+        .orientation_early_exit_conf(0)
+        .build()?;
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rotated_180.png");
+
+    let result = engine.extract(&fixture);
+
+    assert_eq!(
+        result.page_rotations,
+        vec![0],
+        "settling at the first angle should leave the page as uploaded"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_unreachable_early_exit_still_finds_the_rotation() -> anyhow::Result<()> {
+    // The other end: a threshold no score can reach disables the optimization
+    // entirely, so every angle is tried. The answer must be the default's — the
+    // early exit is meant to save passes, never to change the outcome.
+    let mut engine = Engine::builder()
+        .auto_rotate(true)
+        .orientation_early_exit_conf(1000)
+        .build()?;
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rotated_180.png");
+
+    let result = engine.extract(&fixture);
+
+    assert_eq!(result.page_rotations, vec![180]);
+    Ok(())
+}
