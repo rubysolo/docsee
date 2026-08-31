@@ -332,3 +332,61 @@ fn a_zero_probe_dim_does_not_panic() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn a_pool_preserves_page_order() -> anyhow::Result<()> {
+    // The pool finishes out of order by design, so the thing worth pinning is
+    // that the result does not. Assembled from two different images so a
+    // scrambled result is visible: page 1 needs correcting and page 2 does not,
+    // and [0, 180] would be the same multiset as the right answer reversed.
+    //
+    // One engine per test — a second in the same process deadlocks in
+    // `FPDF_InitLibrary` — so this builds a pooled engine and uses it for both
+    // the assembly and the extraction.
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut engine = Engine::builder().auto_rotate(true).ocr_threads(2).build()?;
+
+    let upside_down = dir.join("rotated_180.png");
+    let upright = dir.join("sample.png");
+    let pdf = engine.assemble_pdf(&[
+        docsee::PageRef {
+            path: &upside_down,
+            page_number: 1,
+        },
+        docsee::PageRef {
+            path: &upright,
+            page_number: 1,
+        },
+    ])?;
+
+    let scan = std::env::temp_dir().join("docsee_pool_order.pdf");
+    std::fs::write(&scan, pdf)?;
+
+    let result = engine.extract(&scan);
+    let _ = std::fs::remove_file(&scan);
+
+    assert!(
+        result.error.is_none(),
+        "extraction failed: {:?}",
+        result.error
+    );
+    assert_eq!(result.pages.len(), 2);
+    assert_eq!(result.pages[0].page, 1);
+    assert_eq!(result.pages[1].page, 2);
+    assert_eq!(
+        result.page_rotations,
+        vec![180, 0],
+        "pooled pages came back in the wrong order"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_default_width_is_bounded_and_never_zero() {
+    // A default that can be 0 would mean an engine that recognizes nothing, and
+    // one that tracks a large build machine unbounded would reserve a language
+    // model per core for work that may never arrive. Neither is a number worth
+    // discovering in production.
+    let n = docsee::default_ocr_threads();
+    assert!((1..=4).contains(&n), "default width out of range: {n}");
+}

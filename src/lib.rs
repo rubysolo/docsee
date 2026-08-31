@@ -27,6 +27,8 @@ use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::mpsc;
+use std::sync::Mutex;
 use std::time::Instant;
 
 // Re-exported so callers can name the type accepted by
@@ -163,6 +165,7 @@ pub struct EngineBuilder {
     auto_rotate: bool,
     assembly_page_size: Option<PdfPagePaperSize>,
     orientation_probe_dim: Option<u32>,
+    ocr_threads: Option<usize>,
 }
 
 impl EngineBuilder {
@@ -218,6 +221,38 @@ impl EngineBuilder {
     /// meaningless for ordinary documents.
     pub fn orientation_probe_dim(mut self, px: u32) -> Self {
         self.orientation_probe_dim = Some(px);
+        self
+    }
+
+    /// How many pages of a PDF may be OCR'd at once (default:
+    /// [`default_ocr_threads`], the machine's parallelism capped at 4).
+    ///
+    /// Rasterizing a page needs pdfium and is serialized regardless, but it is
+    /// a small share of an OCR'd page: the orientation vote and the recognition
+    /// pass are tesseract, they dominate, and tesseract is single-threaded. So
+    /// an extract uses one core however many the machine has. Above 1, pages
+    /// are rendered in order on the calling thread and recognized on a pool of
+    /// this many independent tesseract instances. The calling thread only
+    /// rasterizes, so this is the recognition width, not a total thread count.
+    ///
+    /// Costs an OCR instance per worker — roughly 30ms to build and ~55MB of
+    /// language model held resident — and holds up to `ocr_threads` rendered
+    /// page images in memory at once. That is why the pool is built on the
+    /// first multi-threaded OCR of a PDF rather than at
+    /// [`build`](Self::build): an engine that only ever handles image sources,
+    /// native-text PDFs, or renders pays none of it.
+    ///
+    /// Set it to the cores you are willing to spend. Going wider than the
+    /// machine buys nothing, because the work is CPU-bound — and on a host that
+    /// is also serving traffic, spending every core on an extraction is a
+    /// choice about latency elsewhere, which is why this is a knob and not an
+    /// assumption. `1` restores strictly sequential recognition.
+    ///
+    /// Page order is preserved in the result no matter which worker finishes
+    /// first. Per-page timings are still each page's own, so with a pool their
+    /// `started_us` offsets overlap — that is the parallelism, visible.
+    pub fn ocr_threads(mut self, threads: usize) -> Self {
+        self.ocr_threads = Some(threads);
         self
     }
 
@@ -294,6 +329,8 @@ impl EngineBuilder {
             )
         })?;
 
+        let ocr_threads = self.ocr_threads.unwrap_or_else(default_ocr_threads).max(1);
+
         // Last: every `?` above leaves the claim unset, so a failed build does
         // not lock this thread out of trying again.
         ENGINE_LIVE.set(true);
@@ -309,6 +346,9 @@ impl EngineBuilder {
             // Clamped to at least 1: `image::resize` to a zero dimension panics,
             // and a caller passing 0 means "as small as possible", not "crash".
             orientation_probe_dim: self.orientation_probe_dim.unwrap_or(DETECT_MAX_DIM).max(1),
+            ocr_threads,
+            ocr_language: language.to_string(),
+            ocr_pool: Vec::new(),
         })
     }
 }
@@ -345,7 +385,27 @@ pub struct Engine {
     auto_rotate: bool,
     assembly_page_size: PdfPagePaperSize,
     orientation_probe_dim: u32,
+    /// How wide recognition may go; see [`EngineBuilder::ocr_threads`].
+    ocr_threads: usize,
+    /// Kept so the pool can be built after construction.
+    ocr_language: String,
+    /// Recognition instances, one per worker. Empty until the first
+    /// multi-threaded OCR of a PDF actually needs them.
+    ocr_pool: Vec<SendTess>,
 }
+
+/// A recognition instance that may be moved to a worker thread.
+///
+/// `LepTess` holds raw tesseract/leptonica pointers and so is `!Send`. Moving
+/// one is sound here for a specific reason: neither library pins state to the
+/// thread that created it (no TLS), instances share nothing with each other,
+/// and each is owned exclusively by one worker for the life of a scope. This
+/// is emphatically not a claim that a single instance is thread-safe — it is
+/// that separate instances are independent.
+struct SendTess(LepTess);
+
+// SAFETY: see `SendTess`.
+unsafe impl Send for SendTess {}
 
 impl Drop for Engine {
     /// Releases this thread's claim. Dropping the fields is what releases
@@ -432,6 +492,49 @@ impl Engine {
     /// useful. `start` carries the same meaning as in
     /// [`extract_pdf_native_timed`](Self::extract_pdf_native_timed).
     fn extract_pdf_ocr_run(&mut self, path: &Path, dpi: f32, start: Instant) -> Result<OcrRun> {
+        self.ensure_ocr_pool()?;
+        if self.ocr_pool.is_empty() {
+            self.extract_pdf_ocr_serial(path, dpi, start)
+        } else {
+            self.extract_pdf_ocr_pooled(path, dpi, start)
+        }
+    }
+
+    /// Build the recognition pool if this engine is allowed one and has not
+    /// built it yet.
+    ///
+    /// Deferred to the first OCR'd PDF because the cost is real — an instance
+    /// per worker, each ~30ms and ~55MB — and most work never reaches it: image
+    /// sources are single-page, native-text PDFs never recognize anything, and
+    /// renders reuse a known angle.
+    ///
+    /// Built sequentially. Instances are independent once live, but whether
+    /// `TessBaseAPIInit` may be raced is not a question worth having an opinion
+    /// about, and this happens once per engine.
+    fn ensure_ocr_pool(&mut self) -> Result<()> {
+        if self.ocr_threads <= 1 || !self.ocr_pool.is_empty() {
+            return Ok(());
+        }
+        // One instance per worker. The calling thread rasterizes and does not
+        // recognize, so this is `ocr_threads`, not `ocr_threads - 1` — sizing it
+        // one short would silently make `ocr_threads(2)` no wider than serial.
+        for _ in 0..self.ocr_threads {
+            let language = self.ocr_language.clone();
+            self.ocr_pool
+                .push(SendTess(LepTess::new(None, &language).with_context(
+                    || {
+                        format!(
+                            "tesseract init failed for language {language:?} building the OCR pool"
+                        )
+                    },
+                )?));
+        }
+        Ok(())
+    }
+
+    /// One page at a time on the calling thread. What the engine did before
+    /// [`EngineBuilder::ocr_threads`], and what `ocr_threads(1)` restores.
+    fn extract_pdf_ocr_serial(&mut self, path: &Path, dpi: f32, start: Instant) -> Result<OcrRun> {
         let doc = self
             .pdfium
             .load_pdf_from_file(path, None)
@@ -479,6 +582,140 @@ impl Engine {
         Ok(OcrRun {
             pages,
             chars: total,
+            rotations,
+            timings,
+        })
+    }
+
+    /// Rasterize on this thread, recognize on the pool.
+    ///
+    /// The split is where the work actually is: rasterizing needs pdfium and
+    /// cannot be shared, but it is a small share of an OCR'd page — the
+    /// orientation vote and the recognition pass are tesseract and dominate.
+    /// So pages are rendered here in order and handed to workers that own an
+    /// instance each.
+    ///
+    /// The hand-off channel is bounded by the pool size, which is what keeps
+    /// memory flat: at most one rendered page per worker is ever waiting, so a
+    /// long document costs no more than a short one. Results carry their page
+    /// index and are reordered at the end, so output order never depends on
+    /// which worker won.
+    fn extract_pdf_ocr_pooled(&mut self, path: &Path, dpi: f32, start: Instant) -> Result<OcrRun> {
+        let Self {
+            pdfium,
+            ocr_pool,
+            auto_rotate,
+            orientation_probe_dim,
+            ..
+        } = self;
+        let (auto_rotate, probe_dim) = (*auto_rotate, *orientation_probe_dim);
+
+        let doc = pdfium
+            .load_pdf_from_file(path, None)
+            .context("pdfium failed to open document for OCR")?;
+        let config = PdfRenderConfig::new().scale_page_by_factor(dpi / 72.0);
+
+        // (index, rendered page, offset when its work began, rasterize cost)
+        type Job = (usize, DynamicImage, u64, u64);
+        let (tx_job, rx_job) = mpsc::sync_channel::<Job>(ocr_pool.len());
+        let (tx_done, rx_done) = mpsc::channel::<Result<PageWork>>();
+        let rx_job = Mutex::new(rx_job);
+
+        let mut work = std::thread::scope(|scope| -> Result<Vec<PageWork>> {
+            for tess in ocr_pool.iter_mut() {
+                let rx_job = &rx_job;
+                let tx_done = tx_done.clone();
+                scope.spawn(move || {
+                    // The lock is released before the page is recognized: it
+                    // guards taking the next job, not doing it.
+                    while let Ok(job) = {
+                        let next = rx_job.lock().expect("job queue poisoned").recv();
+                        next
+                    } {
+                        let (index, image, started_us, render_us) = job;
+                        let done = ocr_one_page(
+                            &mut tess.0,
+                            index,
+                            image,
+                            started_us,
+                            render_us,
+                            auto_rotate,
+                            probe_dim,
+                            dpi,
+                        );
+                        if tx_done.send(done).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            // Only the workers may hold a sender past this point, or draining
+            // below would wait on a sender that will never send.
+            drop(tx_done);
+
+            let mut render_err = None;
+            for (i, page) in doc.pages().iter().enumerate() {
+                let started_us = elapsed_us(start);
+                let render_start = Instant::now();
+                match page.render_with_config(&config) {
+                    Ok(bitmap) => {
+                        let image = bitmap.as_image();
+                        let render_us = elapsed_us(render_start);
+                        if tx_job.send((i, image, started_us, render_us)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        render_err = Some(
+                            anyhow::Error::new(e)
+                                .context(format!("render failed on page {}", i + 1)),
+                        );
+                        break;
+                    }
+                }
+            }
+            drop(tx_job);
+
+            // Drained before reporting a render failure so no worker is left
+            // blocked on a send into a channel nobody is reading.
+            let mut out = Vec::new();
+            for done in rx_done {
+                out.push(done?);
+            }
+            if let Some(err) = render_err {
+                return Err(err);
+            }
+            Ok(out)
+        })?;
+
+        work.sort_by_key(|w| w.index);
+
+        let chars = work.iter().map(|w| w.text.chars().count()).sum();
+        let rotations = work.iter().map(|w| w.angle).collect();
+        let timings = work
+            .iter()
+            .map(|w| PageTiming {
+                page: (w.index + 1) as u32,
+                extractor: Extractor::OcrPdf,
+                started_us: w.started_us,
+                total_us: w.total_us,
+                render_us: Some(w.render_us),
+                orient_us: w.orient_us,
+                encode_us: Some(w.encode_us),
+                ocr_us: Some(w.ocr_us),
+            })
+            .collect();
+        let pages = work
+            .into_iter()
+            .map(|w| PageText {
+                page: (w.index + 1) as u32,
+                text: w.text,
+            })
+            .collect();
+
+        Ok(OcrRun {
+            pages,
+            chars,
             rotations,
             timings,
         })
@@ -900,6 +1137,82 @@ fn render_page_to_png(
         render_us,
         orient_us,
         encode_us,
+    })
+}
+
+/// Recognition width when the caller has not chosen one: what the machine says
+/// it has, capped at 4.
+///
+/// The cap is about memory, not speed — recognition scales nearly linearly, but
+/// each worker holds a language model, so an uncapped default would reserve
+/// hundreds of megabytes on a large build machine for work that may never need
+/// it. On Linux, `available_parallelism` reflects the cgroup CPU quota, so a
+/// container sees its own budget rather than the host's cores.
+pub fn default_ocr_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(4)
+}
+
+/// One page's recognized text and what each phase of it cost. Carries its own
+/// index because a pool finishes out of order.
+struct PageWork {
+    index: usize,
+    text: String,
+    angle: u32,
+    started_us: u64,
+    total_us: u64,
+    render_us: u64,
+    orient_us: Option<u64>,
+    encode_us: u64,
+    ocr_us: u64,
+}
+
+/// Everything an already-rasterized page still needs: the orientation vote,
+/// the rotate-and-encode, and recognition. Touches no pdfium and no shared
+/// state, which is what makes it safe to run on a worker.
+#[allow(clippy::too_many_arguments)]
+fn ocr_one_page(
+    ocr: &mut LepTess,
+    index: usize,
+    image: DynamicImage,
+    started_us: u64,
+    render_us: u64,
+    auto_rotate: bool,
+    probe_dim: u32,
+    dpi: f32,
+) -> Result<PageWork> {
+    let page_start = Instant::now();
+
+    let (angle, orient_us) = if auto_rotate {
+        let orient_start = Instant::now();
+        let angle = detect_orientation(ocr, &image, probe_dim)?;
+        (angle, Some(elapsed_us(orient_start)))
+    } else {
+        (0, None)
+    };
+
+    let encode_start = Instant::now();
+    let png = encode_png(&rotate_image(image, angle))?;
+    let encode_us = elapsed_us(encode_start);
+
+    let ocr_start = Instant::now();
+    let text = ocr_png_bytes(ocr, &png, dpi as i32)?;
+    let ocr_us = elapsed_us(ocr_start);
+
+    Ok(PageWork {
+        index,
+        text,
+        angle,
+        started_us,
+        // The page's whole cost, rasterization included, even though that
+        // happened on another thread — it is still what this page took.
+        total_us: render_us + elapsed_us(page_start),
+        render_us,
+        orient_us,
+        encode_us,
+        ocr_us,
     })
 }
 
