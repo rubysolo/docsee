@@ -224,8 +224,8 @@ impl EngineBuilder {
         self
     }
 
-    /// How many pages of a PDF may be OCR'd at once (default: 1, one at a
-    /// time — exactly the behavior this engine has always had).
+    /// How many pages of a PDF may be OCR'd at once (default:
+    /// [`default_ocr_threads`], the machine's parallelism capped at 4).
     ///
     /// Rasterizing a page needs pdfium and is serialized regardless, but it is
     /// a small share of an OCR'd page: the orientation vote and the recognition
@@ -235,10 +235,18 @@ impl EngineBuilder {
     /// this many independent tesseract instances. The calling thread only
     /// rasterizes, so this is the recognition width, not a total thread count.
     ///
-    /// Costs an OCR instance per worker — roughly 30ms to build and a language
-    /// model held resident — and holds up to `ocr_threads` rendered page images
-    /// in memory at once. Set it to the cores you are willing to spend; going
-    /// wider than the machine buys nothing, because the work is CPU-bound.
+    /// Costs an OCR instance per worker — roughly 30ms to build and ~55MB of
+    /// language model held resident — and holds up to `ocr_threads` rendered
+    /// page images in memory at once. That is why the pool is built on the
+    /// first multi-threaded OCR of a PDF rather than at
+    /// [`build`](Self::build): an engine that only ever handles image sources,
+    /// native-text PDFs, or renders pays none of it.
+    ///
+    /// Set it to the cores you are willing to spend. Going wider than the
+    /// machine buys nothing, because the work is CPU-bound — and on a host that
+    /// is also serving traffic, spending every core on an extraction is a
+    /// choice about latency elsewhere, which is why this is a knob and not an
+    /// assumption. `1` restores strictly sequential recognition.
     ///
     /// Page order is preserved in the result no matter which worker finishes
     /// first. Per-page timings are still each page's own, so with a pool their
@@ -321,24 +329,7 @@ impl EngineBuilder {
             )
         })?;
 
-        // One instance per worker. The calling thread rasterizes and does not
-        // recognize, so this is `workers`, not `workers - 1` — sizing it one
-        // short would silently make `ocr_threads(2)` no wider than the default.
-        // At 1 the pool is empty, the serial path runs, and nothing about the
-        // engine changes.
-        let workers = self.ocr_threads.unwrap_or(1).max(1);
-        let mut ocr_pool = Vec::new();
-        if workers > 1 {
-            for _ in 0..workers {
-                ocr_pool.push(SendTess(LepTess::new(None, language).with_context(
-                    || {
-                        format!(
-                            "tesseract init failed for language {language:?} building the OCR pool"
-                        )
-                    },
-                )?));
-            }
-        }
+        let ocr_threads = self.ocr_threads.unwrap_or_else(default_ocr_threads).max(1);
 
         // Last: every `?` above leaves the claim unset, so a failed build does
         // not lock this thread out of trying again.
@@ -355,10 +346,9 @@ impl EngineBuilder {
             // Clamped to at least 1: `image::resize` to a zero dimension panics,
             // and a caller passing 0 means "as small as possible", not "crash".
             orientation_probe_dim: self.orientation_probe_dim.unwrap_or(DETECT_MAX_DIM).max(1),
-            // Built here rather than on first use: instances are independent
-            // once live, but they are created by racing nothing, and paying the
-            // model load inside an extract would land in that page's timings.
-            ocr_pool,
+            ocr_threads,
+            ocr_language: language.to_string(),
+            ocr_pool: Vec::new(),
         })
     }
 }
@@ -395,8 +385,12 @@ pub struct Engine {
     auto_rotate: bool,
     assembly_page_size: PdfPagePaperSize,
     orientation_probe_dim: u32,
-    /// Extra recognition instances, one per worker past the calling thread.
-    /// Empty at the default of one thread.
+    /// How wide recognition may go; see [`EngineBuilder::ocr_threads`].
+    ocr_threads: usize,
+    /// Kept so the pool can be built after construction.
+    ocr_language: String,
+    /// Recognition instances, one per worker. Empty until the first
+    /// multi-threaded OCR of a PDF actually needs them.
     ocr_pool: Vec<SendTess>,
 }
 
@@ -498,6 +492,7 @@ impl Engine {
     /// useful. `start` carries the same meaning as in
     /// [`extract_pdf_native_timed`](Self::extract_pdf_native_timed).
     fn extract_pdf_ocr_run(&mut self, path: &Path, dpi: f32, start: Instant) -> Result<OcrRun> {
+        self.ensure_ocr_pool()?;
         if self.ocr_pool.is_empty() {
             self.extract_pdf_ocr_serial(path, dpi, start)
         } else {
@@ -505,8 +500,40 @@ impl Engine {
         }
     }
 
-    /// One page at a time on the calling thread. The engine's only behavior
-    /// before [`EngineBuilder::ocr_threads`], and still its default.
+    /// Build the recognition pool if this engine is allowed one and has not
+    /// built it yet.
+    ///
+    /// Deferred to the first OCR'd PDF because the cost is real — an instance
+    /// per worker, each ~30ms and ~55MB — and most work never reaches it: image
+    /// sources are single-page, native-text PDFs never recognize anything, and
+    /// renders reuse a known angle.
+    ///
+    /// Built sequentially. Instances are independent once live, but whether
+    /// `TessBaseAPIInit` may be raced is not a question worth having an opinion
+    /// about, and this happens once per engine.
+    fn ensure_ocr_pool(&mut self) -> Result<()> {
+        if self.ocr_threads <= 1 || !self.ocr_pool.is_empty() {
+            return Ok(());
+        }
+        // One instance per worker. The calling thread rasterizes and does not
+        // recognize, so this is `ocr_threads`, not `ocr_threads - 1` — sizing it
+        // one short would silently make `ocr_threads(2)` no wider than serial.
+        for _ in 0..self.ocr_threads {
+            let language = self.ocr_language.clone();
+            self.ocr_pool
+                .push(SendTess(LepTess::new(None, &language).with_context(
+                    || {
+                        format!(
+                            "tesseract init failed for language {language:?} building the OCR pool"
+                        )
+                    },
+                )?));
+        }
+        Ok(())
+    }
+
+    /// One page at a time on the calling thread. What the engine did before
+    /// [`EngineBuilder::ocr_threads`], and what `ocr_threads(1)` restores.
     fn extract_pdf_ocr_serial(&mut self, path: &Path, dpi: f32, start: Instant) -> Result<OcrRun> {
         let doc = self
             .pdfium
@@ -1111,6 +1138,21 @@ fn render_page_to_png(
         orient_us,
         encode_us,
     })
+}
+
+/// Recognition width when the caller has not chosen one: what the machine says
+/// it has, capped at 4.
+///
+/// The cap is about memory, not speed — recognition scales nearly linearly, but
+/// each worker holds a language model, so an uncapped default would reserve
+/// hundreds of megabytes on a large build machine for work that may never need
+/// it. On Linux, `available_parallelism` reflects the cgroup CPU quota, so a
+/// container sees its own budget rather than the host's cores.
+pub fn default_ocr_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(4)
 }
 
 /// One page's recognized text and what each phase of it cost. Carries its own

@@ -380,3 +380,13 @@ fn a_pool_preserves_page_order() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn the_default_width_is_bounded_and_never_zero() {
+    // A default that can be 0 would mean an engine that recognizes nothing, and
+    // one that tracks a large build machine unbounded would reserve a language
+    // model per core for work that may never arrive. Neither is a number worth
+    // discovering in production.
+    let n = docsee::default_ocr_threads();
+    assert!((1..=4).contains(&n), "default width out of range: {n}");
+}

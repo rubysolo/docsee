@@ -35,16 +35,20 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `None` means "don't call the setter", so a bare run measures the library
+    // default rather than a number this bench chose for it.
     let (threads, file) = match &args[..] {
-        [flag, n, file] if flag == "--threads" => (n.parse::<usize>()?, file.clone()),
-        [file] => (1, file.clone()),
+        [flag, n, file] if flag == "--threads" => (Some(n.parse::<usize>()?), file.clone()),
+        [file] => (None, file.clone()),
         _ => bail!("usage: ocr_pool_bench [--threads N] <file.pdf>"),
     };
 
-    let mut engine = Engine::builder()
-        .auto_rotate(true)
-        .ocr_threads(threads)
-        .build()?;
+    let mut builder = Engine::builder().auto_rotate(true);
+    if let Some(threads) = threads {
+        builder = builder.ocr_threads(threads);
+    }
+    let mut engine = builder.build()?;
+    let threads = threads.unwrap_or_else(docsee::default_ocr_threads);
 
     let started = Instant::now();
     let result = engine.extract(Path::new(&file));
