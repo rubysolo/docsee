@@ -21,7 +21,7 @@
 
 use anyhow::{bail, Context, Result};
 use image::{DynamicImage, ImageDecoder, ImageReader};
-use leptess::LepTess;
+use leptess::{LepTess, Variable};
 use pdfium_render::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
@@ -1400,7 +1400,36 @@ const MIN_ORIENTATION_MARGIN: i32 = 10;
 /// written down beside it, so the two cannot drift apart.
 const SOUND_EARLY_EXIT_CONF: i32 = 100 - MIN_ORIENTATION_MARGIN;
 
+/// The vote, with tesseract's inversion retry switched off for its duration.
+///
+/// `tessedit_do_invert` makes tesseract re-try a poorly-recognized word with the
+/// polarity flipped, in case it was white-on-black. For this vote that is wasted
+/// work *by construction*: three of the four angles are meant to recognize
+/// badly, so the retry fires on nearly every word of nearly every losing pass to
+/// re-learn what the vote already assumes. Measured over a 223-page corpus of
+/// scans it is 28% of the vote's cost.
+///
+/// Restored afterwards rather than set once on the engine, because the instance
+/// is shared with the extraction pass. On tesseract 5.5.3 that restore is
+/// belt-and-braces rather than load-bearing — page polarity is handled at
+/// binarization, and a white-on-black page extracts the same with the retry off
+/// — but the vote has no business deciding a recognition setting for everything
+/// downstream of it, and the guarantee is one FFI call.
 fn detect_orientation(
+    ocr: &mut LepTess,
+    image: &DynamicImage,
+    max_dim: u32,
+    early_exit_conf: i32,
+) -> Result<u32> {
+    // A tesseract that declines the variable is not worth failing an extraction
+    // over; the vote then simply costs what it cost before.
+    let _ = ocr.set_variable(Variable::TesseditDoInvert, "0");
+    let angle = vote_on_orientation(ocr, image, max_dim, early_exit_conf);
+    let _ = ocr.set_variable(Variable::TesseditDoInvert, "1");
+    angle
+}
+
+fn vote_on_orientation(
     ocr: &mut LepTess,
     image: &DynamicImage,
     max_dim: u32,
@@ -1415,6 +1444,14 @@ fn detect_orientation(
     } else {
         image.clone()
     };
+
+    // Grayscale once, here, rather than four times inside tesseract. Everything
+    // upstream hands this function colour — pdfium renders RGB and
+    // `normalize_image_for_ocr` returns it — and tesseract's first move on a
+    // colour page is to convert it, once per angle. Doing it up front also
+    // thirds the PNG that each pass encodes and leptonica decodes. The vote
+    // reads shapes; colour was never one of the things it looks at.
+    let probe = DynamicImage::ImageLuma8(probe.to_luma8());
 
     let angles = [0, 90, 180, 270];
     let mut best_angle = 0;
